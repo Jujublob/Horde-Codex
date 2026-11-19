@@ -33,16 +33,33 @@ export function writeFile(p, code) {
   return { full, bak };
 }
 
+let current = null;
+
+// Tue la commande et tous ses sous-processus (groupe de processus)
+function killTree(p) {
+  try { process.kill(-p.pid, 'SIGTERM'); }
+  catch { try { p.kill('SIGTERM'); } catch {} }
+}
+
+// Interrompt la commande en cours (utilisé par /stop)
+export function killRunning() {
+  if (!current) return false;
+  killTree(current);
+  return true;
+}
+
 export function run(cmd) {
   return new Promise((resolve) => {
     let out = '';
-    const p = spawn('bash', ['-c', cmd], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] });
+    const p = spawn('bash', ['-c', cmd], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    current = p;
     const add = (d) => { process.stdout.write(d); out += d; };
     p.stdout.on('data', add);
     p.stderr.on('data', add);
-    const timer = setTimeout(() => p.kill(), 120000);
-    p.on('close', (code) => { clearTimeout(timer); resolve({ code, out: out.slice(-2500) }); });
-    p.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, out: e.message }); });
+    const timer = setTimeout(() => killTree(p), 120000);
+    const done = (r) => { clearTimeout(timer); if (current === p) current = null; resolve(r); };
+    p.on('close', (code, sig) => done({ code: code ?? (sig ? `interrompu (${sig})` : -1), out: out.slice(-2500) }));
+    p.on('error', (e) => done({ code: -1, out: e.message }));
   });
 }
 

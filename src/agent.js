@@ -1,17 +1,22 @@
-import { searchWeb } from './search_tool.js';
+import fs from 'fs';
+import os from 'os';
 import readline from 'readline';
 import chalk from 'chalk';
-import { FAVORITES, SYSTEM_PROMPT } from './config.js';
+import { searchWeb } from './search_tool.js';
+import { FAVORITES, MAX_STEPS } from './config.js';
 import { chat, liveModels } from './api.js';
 import { spinner, printReply } from './ui.js';
 import { buildSystem } from './context.js';
-import { MAX_STEPS } from './config.js';
 import { extractBlocks, expand, writeFile, run, isDangerous, isReadOnly } from './exec.js';
 
 export const S = {
   model: FAVORITES[0], models: [...FAVORITES], auto: false, pending: [], last: null,
   messages: [{ role: 'system', content: buildSystem() }]
 };
+const tried = new Set();
+const MEM_PATH = expand('~/.ia_memory.json');
+const SESS = os.homedir() + '/.horde_session.json';
+
 const CMDS = ['/help', '/live', '/use ', '/file ', '/paste', '/cd ', '/auto', '/save', '/clear', '/exit', '/1', '/2', '/3', '/4', '/5'];
 const completer = (l) => { const h = CMDS.filter(c => c.startsWith(l)); return [h.length ? h : CMDS, l]; };
 export const rl = readline.createInterface({ input: process.stdin, output: process.stdout, completer });
@@ -27,7 +32,6 @@ export async function showModels(unavailable) {
   } catch { console.log(chalk.red('Erreur réseau (liste des modèles).')); }
 }
 
-
 async function confirm(q) {
   const a = await ask(chalk.yellow(q + ' [o/N/a=toujours] '));
   if (a === 'a') { S.auto = true; console.log(chalk.red('Mode auto activé.')); }
@@ -39,9 +43,43 @@ function refuse() {
   S.refused = true;
 }
 
+// Recherche web : jamais d'exception, toujours une réponse exploitable par le modèle
+async function safeSearch(query) {
+  try {
+    const r = await searchWeb(query);
+    const txt = String(r ?? '').trim();
+    return txt || '(aucun résultat)';
+  } catch (e) {
+    return `(recherche web indisponible : ${e.message})`;
+  }
+}
+
+// Blocs ```search requête``` : le modèle lance une recherche de sa propre initiative, sans confirmation
+async function doSearches(reply) {
+  const re = /```search\n([\s\S]*?)```/g;
+  let m, n = 0;
+  while ((m = re.exec(reply)) && n < 3) {
+    const q = m[1].trim();
+    if (!q) continue;
+    n++;
+    console.log(chalk.cyan(`🌐 Recherche web : ${q}`));
+    const res = await safeSearch(q);
+    S.pending.push(`[Résultats web pour « ${q} » :\n${res}]`);
+  }
+}
+
 async function doFile(b) {
+  const isMem = expand(b.path) === MEM_PATH;
   console.log(chalk.blue(`\n📝 Écrire : ${b.path} (${b.code.split('\n').length} lignes)`));
-  if (!S.auto && expand(b.path) !== expand('~/.ia_memory.json') && !(await confirm('Appliquer ?'))) return refuse();
+  if (isMem) {
+    try { JSON.parse(b.code); }
+    catch (e) {
+      console.log(chalk.red('✘ Mémoire non écrite : JSON invalide.'));
+      S.pending.push(`[Fichier ${b.path} NON écrit : JSON invalide (${e.message}). Renvoie le contenu COMPLET en JSON valide.]`);
+      return;
+    }
+  }
+  if (!S.auto && !isMem && !(await confirm('Appliquer ?'))) return refuse();
   const r = writeFile(b.path, b.code);
   console.log(chalk.green(`✔ ${r.full}${r.bak ? ' (ancienne version : .bak)' : ''}`));
   S.pending.push(`[Fichier ${b.path} écrit avec succès]`);
@@ -58,6 +96,8 @@ function doCd(dir) {
 async function doCmd(b) {
   const danger = isDangerous(b.code);
   const safe = isReadOnly(b.code);
+  // L'IA peut exiger ta validation en mettant "# CONFIRM" en première ligne du bloc bash
+  const force = /^\s*#\s*CONFIRM\b/i.test(b.code);
   if (/(node\s+|\.\/)index\.js/.test(b.code)) {
     console.log(chalk.red('⛔ Refusé : relancerait ce CLI.'));
     S.pending.push('[Refusé : node index.js relance ce CLI interactif. Utilise node --check index.js.]');
@@ -65,7 +105,8 @@ async function doCmd(b) {
   }
   console.log(chalk.blue(safe ? '\n🔍 Lecture :\n' : '\n⚡ Commande :\n') + chalk.white(b.code));
   if (danger) console.log(chalk.red.bold('⛔ Commande dangereuse : confirmation obligatoire.'));
-  const skip = !danger && (safe || S.auto || /^node\s+~\/horde-cli\/search_tool\.js/.test(b.code.trim()));
+  if (force) console.log(chalk.yellow.bold('🔒 L\'IA demande ta validation pour cette commande.'));
+  const skip = !force && !danger && (safe || S.auto || /^node\s+~\/horde-cli\/search_tool\.js/.test(b.code.trim()));
   if (!skip && !(await confirm('Exécuter ?'))) return refuse();
   const cd = b.code.trim().match(/^cd\s+(.+)$/);
   if (cd) return doCd(cd[1]);
@@ -75,6 +116,7 @@ async function doCmd(b) {
 }
 
 async function handleBlocks(reply) {
+  await doSearches(reply);
   for (const b of extractBlocks(reply)) {
     if (b.type === 'file') await doFile(b);
     else await doCmd(b);
@@ -82,11 +124,12 @@ async function handleBlocks(reply) {
   }
 }
 
-export async function askAI(input, depth = 0) {
+export async function askAI(input, depth = 0, retry = false) {
+  // Nouveau message de l'utilisateur : on repart avec une liste de modèles essayés vide
+  if (depth === 0 && !retry) tried.clear();
   const prev = S.pending;
   S.pending = [];
   S.refused = false;
-  if (depth === 0 && !/(\.js|horde-cli|fichier)/i.test(input) && /(\?|cherche|recherche|actualit|news|qui est|quel|quelle|m[ée]t[ée]o|prix|2025|2026)/i.test(input)) { console.log(chalk.cyan("🌐 Recherche web...")); prev.push("[Résultats Web (réponds directement sans commande) :\n" + await searchWeb(input.replace(/^\?\s*/, "")) + "]"); }
   S.messages.push({ role: 'user', content: [...prev, input].join('\n\n') });
   if (S.messages.length > 17) {
     S.messages = [S.messages[0], ...S.messages.slice(-12)];
@@ -115,7 +158,6 @@ export async function askAI(input, depth = 0) {
   }
 }
 
-const tried = new Set();
 const PREF = ['Coder', 'Qwen', 'Mistral', 'Llama-3.3', 'gemma', 'Llama'];
 const sizeOf = (m) => parseFloat(m.match(/(\d+(?:\.\d+)?)B/i)?.[1] || 0);
 const score = (m) => { const i = PREF.findIndex(p => m.includes(p)); return i < 0 ? 0 : PREF.length - i; };
@@ -130,13 +172,9 @@ async function failover(e, depth) {
   if (!ok.length) { console.log(chalk.red('Aucun modèle de remplacement. Réessaie plus tard.')); return false; }
   S.model = ok[0];
   console.log(chalk.yellow(`↻ Bascule auto vers ${S.model.split('/').pop()}`));
-  await askAI(S.last, depth);
+  await askAI(S.last, depth, true);
   return true;
 }
-
-import fs from 'fs';
-import os from 'os';
-const SESS = os.homedir() + '/.horde_session.json';
 
 export function saveSession() {
   try { fs.writeFileSync(SESS, JSON.stringify(S.messages)); } catch {}

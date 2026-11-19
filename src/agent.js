@@ -1,10 +1,11 @@
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 import readline from 'readline';
 import chalk from 'chalk';
 import { searchWeb } from './search_tool.js';
 import { FAVORITES, MAX_STEPS } from './config.js';
-import { chat, liveModels } from './api.js';
+import { chat, liveModels, getFinishReason } from './api.js';
 import { spinner, printReply } from './ui.js';
 import { buildSystem } from './context.js';
 import { extractBlocks, expand, writeFile, run, isDangerous, isReadOnly } from './exec.js';
@@ -29,7 +30,7 @@ export async function showModels(unavailable) {
     S.models = list.slice(0, 15);
     console.log(chalk.cyan.bold(unavailable ? '\n⚠ Modèle indisponible. Choisis avec /use <n> :' : '\n🟢 Modèles en ligne :'));
     S.models.forEach((m, i) => console.log(chalk.yellow(`  [${i + 1}] `) + chalk.green(m)));
-  } catch { console.log(chalk.red('Erreur réseau (liste des modèles).')); }
+  } catch (e) { console.log(chalk.red(`Liste des modèles : ${e.message}`)); }
 }
 
 async function confirm(q) {
@@ -85,6 +86,32 @@ async function doFile(b) {
   S.pending.push(`[Fichier ${b.path} écrit avec succès]`);
 }
 
+// Blocs ```append:chemin``` : ajoute la suite d'un fichier écrit en plusieurs réponses
+async function doAppends(reply) {
+  const re = /```append:([^\n]+)\n([\s\S]*?)```/g;
+  let m;
+  while ((m = re.exec(reply))) {
+    const p = m[1].trim();
+    const code = m[2].replace(/\n$/, '');
+    if (expand(p) === MEM_PATH) {
+      S.pending.push(`[Append refusé sur ${p} : réécris la mémoire en entier avec un bloc file: en JSON valide.]`);
+      continue;
+    }
+    console.log(chalk.blue(`\n➕ Ajouter à : ${p} (${code.split('\n').length} lignes)`));
+    if (!S.auto && !(await confirm('Ajouter ?'))) return refuse();
+    try {
+      const full = expand(p);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.appendFileSync(full, code + '\n');
+      console.log(chalk.green(`✔ ${full} (suite ajoutée)`));
+      S.pending.push(`[Suite ajoutée à ${p} avec succès]`);
+    } catch (e) {
+      console.log(chalk.red(e.message));
+      S.pending.push(`[Échec de l'ajout à ${p} : ${e.message}]`);
+    }
+  }
+}
+
 function doCd(dir) {
   try {
     process.chdir(expand(dir.replace(/^["']|["']$/g, '')));
@@ -122,6 +149,7 @@ async function handleBlocks(reply) {
     else await doCmd(b);
     if (S.refused) break;
   }
+  if (!S.refused) await doAppends(reply);
 }
 
 export async function askAI(input, depth = 0, retry = false) {
@@ -138,12 +166,17 @@ export async function askAI(input, depth = 0, retry = false) {
   const stop = spinner(S.model.split('/').pop());
   try {
     const reply = await chat(S.model, S.messages);
+    const cut = getFinishReason() === 'length';
     stop();
     if (!reply) throw new Error('Réponse vide.');
     S.messages.push({ role: 'assistant', content: reply });
     S.last = null; tried.clear(); saveSession();
     printReply(reply);
     await handleBlocks(reply);
+    if (cut) {
+      console.log(chalk.yellow('✂ Réponse coupée par la limite de tokens.'));
+      S.pending.push("[Ta réponse a été coupée (limite de tokens) : un bloc incomplet n'a PAS été exécuté. Reprends en blocs plus courts : file:chemin pour la 1re partie, puis append:chemin pour la suite, une partie par réponse.]");
+    }
     if (S.pending.length && !S.refused) {
       if (depth >= MAX_STEPS) console.log(chalk.yellow(`⏸ Pause après ${MAX_STEPS} étapes. Écris "continue" pour poursuivre.`));
       else await askAI('Résultats ci-dessus. Vérifie, poursuis ou termine (TERMINÉ).', depth + 1);

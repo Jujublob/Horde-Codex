@@ -1,12 +1,9 @@
 import chalk from 'chalk';
-import { API_URL, MODELS_URL, API_KEY, TIMEOUT_MS } from './config.js';
+import { API_URL, MODELS_URL, API_KEY, TIMEOUT_MS, TEMP_CODE, TEMP_CHAT } from './config.js';
 
 const MAX_PROMPT_TOKENS = 2200;
 const MAX_REPLY_TOKENS = 650;
 const MODELS_TIMEOUT_MS = 20000;
-// À déplacer plus tard dans config.js
-const TEMP_CODE = 0.3;
-const TEMP_CHAT = 0.6;
 
 let warnedTrunc = false;
 let lastFinish = null;

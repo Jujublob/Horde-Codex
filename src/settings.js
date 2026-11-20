@@ -54,3 +54,27 @@ export function setFavorites(list) {
   if (list) s.favorites = [...list]; else delete s.favorites;
   save();
 }
+
+// ---------- Autres fournisseurs IA (Gemini, OpenAI, Claude, personnalisés...) ----------
+// Chaque fournisseur : { name, type: 'openai' | 'anthropic', baseUrl, key }
+export function getProviders() {
+  const p = load().providers;
+  return p && typeof p === 'object' && !Array.isArray(p) ? p : {};
+}
+export const getProvider = (id) => getProviders()[id] || null;
+
+export function setProvider(id, data) {
+  const s = load();
+  s.providers = { ...getProviders(), [id]: data };
+  save();
+}
+
+export function removeProvider(id) {
+  const s = load();
+  const all = { ...getProviders() };
+  const existed = id in all;
+  delete all[id];
+  s.providers = all;
+  save();
+  return existed;
+}

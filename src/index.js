@@ -1,67 +1,298 @@
 #!/usr/bin/env node
-import { buildSystem } from './context.js';
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import chalk from 'chalk';
-import { FAVORITES, SYSTEM_PROMPT, MAX_FILE_CHARS } from './config.js';
+import { buildSystem } from './context.js';
+import { FAVORITES, MAX_FILE_CHARS } from './config.js';
 import { banner, help } from './ui.js';
 import { expand, run } from './exec.js';
-import { S, rl, askAI, showModels, saveSession, loadSession, pickStrongest } from './agent.js';
+import { getHordeKey, getSearchKey, setHordeKey, setSearchKey, keySource, maskKey, setFavorites, getProviders, getProvider, setProvider, removeProvider } from './settings.js';
+import { S, rl, askAI, askRaw, showModels, saveSession, loadSession, pickStrongest, interrupt, refreshSystem } from './agent.js';
+import { listModels } from './api.js';
+import { PRESETS, PRESET_ALIASES, parseRef, makeRef } from './models.js';
 
 let buffer = null;
-const show = () => banner(S.model, S.auto);
+let busy = false;
+let lastSigint = 0;
+
+const show = () => banner(S.model, S.auto, { search: !!getSearchKey() });
 const prompt = () => {
   const dir = process.cwd().split('/').pop() || '/';
   rl.setPrompt(chalk.cyan.bold(`\n${dir}${S.auto ? " [AUTO]" : ""} ❯ `));
   rl.prompt();
 };
+
+// Nom lisible d'une référence de modèle
+const label = (ref) => {
+  const { provider, model } = parseRef(ref);
+  return provider === 'horde' ? model : `${model}  (${provider})`;
+};
+
+// "gemini gemini-2.5-flash" → référence ; null si le premier mot n'est pas un fournisseur
+function refFromArgs(tokens) {
+  const [first, ...rest] = tokens;
+  if (rest.length && (first === 'horde' || getProvider(first))) return makeRef(first, rest.join(' '));
+  return null;
+}
+
 async function useModel(m) {
   S.model = m;
   show();
-  console.log(chalk.green('✔ Modèle : ' + m));
+  console.log(chalk.green('✔ Modèle : ' + label(m)));
   if (S.last) await askAI(S.last);
 }
 
+// ---------- Fichiers (découpés en parties pour respecter le budget de tokens) ----------
+function splitParts(text, size) {
+  const parts = [];
+  let cur = '';
+  for (const line of text.split('\n')) {
+    let l = line;
+    while (l.length > size) {
+      if (cur) { parts.push(cur); cur = ''; }
+      parts.push(l.slice(0, size));
+      l = l.slice(size);
+    }
+    if (cur && cur.length + l.length + 1 > size) { parts.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + l;
+  }
+  if (cur) parts.push(cur);
+  return parts.length ? parts : [''];
+}
+
 async function sendFile(arg) {
-  const p = expand(arg.trim());
+  let target = arg.trim();
+  let part = 1;
+  const m = target.match(/^(.*\S)\s+(\d+)$/);
+  if (m && fs.existsSync(expand(m[1]))) { target = m[1]; part = parseInt(m[2], 10); }
+  const p = expand(target);
   if (!fs.existsSync(p) || !fs.statSync(p).isFile()) {
     console.log(chalk.red('Fichier introuvable : ' + p));
     return;
   }
-  let c = fs.readFileSync(p, 'utf-8');
-  if (c.length > MAX_FILE_CHARS) {
-    console.log(chalk.yellow(`⚠ Tronqué à ${MAX_FILE_CHARS} caractères.`));
-    c = c.slice(0, MAX_FILE_CHARS);
+  const parts = splitParts(fs.readFileSync(p, 'utf-8'), MAX_FILE_CHARS);
+  if (part < 1 || part > parts.length) {
+    console.log(chalk.red(`Ce fichier n'a que ${parts.length} partie(s).`));
+    return;
   }
-  await askAI(`Contenu de \`${p}\` :\n\n\`\`\`\n${c}\n\`\`\`\nAnalyse-le.`);
+  const multi = parts.length > 1;
+  if (multi) {
+    console.log(chalk.yellow(`📄 Partie ${part}/${parts.length}` + (part < parts.length ? ` — /file ${target} ${part + 1} pour la suite.` : ' (dernière).')));
+  }
+  await askAI(
+    `Contenu de \`${p}\`${multi ? ` (partie ${part}/${parts.length})` : ''} :\n\n\`\`\`\n${parts[part - 1]}\n\`\`\`\n` +
+    (multi ? "Fichier envoyé en plusieurs parties : analyse celle-ci, la suite viendra si besoin." : 'Analyse-le.')
+  );
 }
 
+// ---------- Sauvegarde de la conversation ----------
 function save() {
-  const f = `${os.homedir()}/horde-cli/historique-${Date.now()}.md`;
-  fs.writeFileSync(f, S.messages.slice(1).map(m => `## ${m.role}\n\n${m.content}\n`).join('\n'));
-  console.log(chalk.green('✔ Sauvegardé : ' + f));
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url));
+    const f = path.join(dir, `historique-${Date.now()}.md`);
+    fs.writeFileSync(f, S.messages.slice(1).map(m => `## ${m.role}\n\n${m.content}\n`).join('\n'));
+    console.log(chalk.green('✔ Sauvegardé : ' + f));
+  } catch (e) { console.log(chalk.red('✘ Sauvegarde impossible : ' + e.message)); }
 }
 
+// ---------- Modèles favoris ----------
+function showFavs() {
+  console.log(chalk.hex('#c084fc').bold('\n Modèles favoris'));
+  S.favs.forEach((m, i) => console.log(
+    `  ${chalk.hex('#fbbf24')(`/${i + 1}`.padEnd(5))}${m === S.model ? chalk.green('● ') : '  '}${chalk.hex('#34d399')(label(m))}`));
+  console.log(chalk.gray('\n  /fav add [n°|nom] · /fav del <n°> · /fav reset\n'));
+}
+
+function favCommand(arg) {
+  const [sub, ...rest] = arg.trim().split(/\s+/).filter(Boolean);
+  const val = rest.join(' ');
+  if (!sub) return showFavs();
+  if (sub === 'add') {
+    const m = !val ? S.model : /^\d+$/.test(val) ? S.models[+val - 1] : (refFromArgs(val.split(/\s+/)) || val);
+    if (!m) return console.log(chalk.red('Numéro invalide (utilise celui de /live).'));
+    if (S.favs.includes(m)) return console.log(chalk.yellow('Déjà dans les favoris.'));
+    S.favs.push(m);
+    setFavorites(S.favs);
+    console.log(chalk.green(`✔ Ajouté : /${S.favs.length} → ${label(m)}`));
+  } else if (sub === 'del' || sub === 'rm') {
+    const i = parseInt(val, 10) - 1;
+    if (!(i >= 0 && i < S.favs.length)) return console.log(chalk.red('Numéro de favori invalide.'));
+    if (S.favs.length === 1) return console.log(chalk.red('Garde au moins un favori.'));
+    const [gone] = S.favs.splice(i, 1);
+    setFavorites(S.favs);
+    console.log(chalk.green(`✔ Retiré : ${label(gone)}`));
+  } else if (sub === 'reset') {
+    S.favs.splice(0, S.favs.length, ...FAVORITES);
+    setFavorites(null);
+    console.log(chalk.green('✔ Favoris par défaut rétablis.'));
+  } else {
+    return console.log(chalk.red('Usage : /fav, /fav add [n°|nom], /fav del <n°>, /fav reset'));
+  }
+  showFavs();
+}
+
+// ---------- Clés API (enregistrées dans ~/.horde_settings.json, hors du dossier du programme) ----------
+function keyCommand(which, arg) {
+  const horde = which === 'horde';
+  const label = horde ? 'AI Horde' : 'recherche web';
+  const v = arg.trim();
+  if (!v) {
+    const src = keySource(which);
+    const k = horde ? getHordeKey() : getSearchKey();
+    if (horde && !src) console.log(`Clé ${label} : anonyme (aucune clé définie). /apihorde <clé> pour en définir une.`);
+    else if (!k) console.log(`Clé ${label} : non définie. /apisearch <clé> pour activer la recherche web.`);
+    else console.log(`Clé ${label} : ${maskKey(k)} (via ${src})`);
+    return;
+  }
+  if (/\s/.test(v)) return console.log(chalk.red('La clé ne doit pas contenir d’espace.'));
+  if (v.toLowerCase() === 'off') {
+    if (horde) setHordeKey(null); else setSearchKey(null);
+    console.log(chalk.green(`✔ Clé ${label} retirée.`));
+  } else {
+    if (horde) setHordeKey(v); else setSearchKey(v);
+    console.log(chalk.green(`✔ Clé ${label} enregistrée (${maskKey(v)}) : elle sera conservée après les mises à jour.`));
+  }
+  if (!horde) {
+    refreshSystem();
+    console.log(chalk.gray(getSearchKey() ? 'Recherche web activée.' : 'Recherche web désactivée.'));
+  }
+}
+
+// ---------- Fournisseurs IA (Gemini, ChatGPT, Claude, personnalisés...) ----------
+const normKey = (k) => (['none', '-', 'aucune'].includes((k || '').toLowerCase()) ? '' : k);
+
+function showProviders() {
+  const row = (id, name, detail) => console.log(`  ${chalk.hex('#fbbf24')(id.padEnd(12))}${chalk.hex('#34d399')(name.padEnd(20))}${chalk.hex('#94a3b8')(detail)}`);
+  console.log(chalk.hex('#c084fc').bold('\n Fournisseurs IA'));
+  const hk = keySource('horde');
+  row('horde', 'AI Horde', hk ? `clé ${maskKey(getHordeKey())} (${hk})` : 'clé anonyme');
+  for (const [id, p] of Object.entries(getProviders())) {
+    row(id, clipName(p.name || id), `${p.key ? 'clé ' + maskKey(p.key) : 'sans clé'} · ${p.type}`);
+  }
+  console.log(chalk.gray('\n  /api add · /api del <id> · /api test <id> · /live <id> [mots] · /use <id> <modèle>\n'));
+}
+const clipName = (s) => (s.length > 19 ? s.slice(0, 18) + '…' : s);
+
+async function testProvider(id) {
+  try {
+    const list = await listModels(id);
+    console.log(chalk.green(`✔ Connexion OK : ${list.length} modèle(s). /live ${id} pour les voir, /live ${id} <mot> pour chercher.`));
+  } catch (e) {
+    console.log(chalk.yellow(`⚠ Test échoué : ${e.message}`));
+    console.log(chalk.gray(`  La configuration est enregistrée. Pour corriger la clé : /api add ${id} <nouvelle clé>`));
+  }
+}
+
+async function saveProvider(id, data) {
+  setProvider(id, data);
+  console.log(chalk.green(`✔ ${data.name} enregistré (${data.key ? maskKey(data.key) : 'sans clé'}) : conservé après les mises à jour.`));
+  await testProvider(id);
+}
+
+// Menu guidé : choisir un fournisseur dans la liste, puis coller la clé
+async function providerWizard() {
+  const ids = Object.keys(PRESETS);
+  console.log(chalk.hex('#c084fc').bold('\n Ajouter un fournisseur IA\n'));
+  ids.forEach((id, i) => console.log(`  ${chalk.yellow(`[${i + 1}]`)} ${PRESETS[id].name}`));
+  console.log(`  ${chalk.yellow(`[${ids.length + 1}]`)} Autre (n'importe quelle API compatible OpenAI, ou Ollama / LM Studio en local)\n`);
+  const n = parseInt(await askRaw(chalk.cyan(' Numéro (vide = annuler) : ')), 10);
+  if (!(n >= 1 && n <= ids.length + 1)) return console.log(chalk.gray('Annulé.'));
+  let id, data;
+  if (n <= ids.length) {
+    id = ids[n - 1];
+    data = { ...PRESETS[id] };
+  } else {
+    id = (await askRaw(chalk.cyan(' Identifiant court (ex : monia) : '))).toLowerCase();
+    if (!/^[a-z0-9_-]+$/.test(id) || id === 'horde') return console.log(chalk.red('Identifiant invalide (lettres, chiffres, - et _).'));
+    const url = await askRaw(chalk.cyan(' URL de base (ex : https://exemple.com/v1) : '));
+    if (!/^https?:\/\//.test(url)) return console.log(chalk.red('URL invalide.'));
+    const claude = /anthropic\.com/.test(url) || (await askRaw(chalk.cyan(' API de type Claude/Anthropic ? (o/N) : '))).toLowerCase() === 'o';
+    data = { name: id, type: claude ? 'anthropic' : 'openai', baseUrl: url.replace(/\/+$/, '') };
+  }
+  const key = await askRaw(chalk.cyan(` Clé API ${data.name} (« none » si aucune) : `));
+  if (!key) return console.log(chalk.gray('Annulé.'));
+  if (/\s/.test(key)) return console.log(chalk.red('La clé ne doit pas contenir d’espace.'));
+  await saveProvider(id, { ...data, key: normKey(key) });
+}
+
+async function addProvider(args) {
+  if (!args.length) return providerWizard();
+  let [id, key, url, type] = args;
+  id = id.toLowerCase();
+  id = PRESET_ALIASES[id] || id;
+  if (id === 'horde') return console.log(chalk.yellow('Pour AI Horde : /apihorde <clé>'));
+  if (!/^[a-z0-9_-]+$/.test(id)) return console.log(chalk.red('Identifiant invalide (lettres, chiffres, - et _).'));
+  if (!key) return console.log(chalk.red('Usage : /api add <id> <clé> [url] [anthropic]   (ou /api add pour le menu)'));
+  const preset = PRESETS[id];
+  let data;
+  if (preset && !url) data = { ...preset };
+  else if (url && /^https?:\/\//.test(url)) {
+    data = { name: preset?.name || id, type: (type === 'anthropic' || /anthropic\.com/.test(url)) ? 'anthropic' : 'openai', baseUrl: url.replace(/\/+$/, '') };
+  } else {
+    return console.log(chalk.red(`« ${id} » n'est pas un fournisseur connu : ajoute l'URL (ex : /api add ${id} <clé> https://exemple.com/v1).`));
+  }
+  await saveProvider(id, { ...data, key: normKey(key) });
+}
+
+async function apiCommand(arg) {
+  const [sub, ...rest] = arg.trim().split(/\s+/).filter(Boolean);
+  if (!sub || sub === 'list') return showProviders();
+  if (sub === 'add') return addProvider(rest);
+  if (sub === 'del' || sub === 'rm') {
+    const id = (rest[0] || '').toLowerCase();
+    if (!removeProvider(id)) return console.log(chalk.red(`Fournisseur inconnu : « ${id} ».`));
+    console.log(chalk.green(`✔ ${id} retiré.`));
+    if (parseRef(S.model).provider === id) console.log(chalk.yellow('⚠ Le modèle actuel venait de ce fournisseur : choisis-en un autre (/1, /live...).'));
+    if (S.favs.some(f => parseRef(f).provider === id)) console.log(chalk.gray('  Des favoris utilisent ce fournisseur : /fav pour les retirer.'));
+    return;
+  }
+  if (sub === 'test') {
+    const id = (rest[0] || '').toLowerCase();
+    if (id !== 'horde' && !getProvider(id)) return console.log(chalk.red(`Fournisseur inconnu : « ${id} ». /api pour la liste.`));
+    return testProvider(id);
+  }
+  console.log(chalk.red('Usage : /api, /api add, /api del <id>, /api test <id>'));
+}
+
+// /live [fournisseur] [mots] : liste / recherche de modèles
+async function liveCommand(arg) {
+  const tokens = arg.trim().split(/\s+/).filter(Boolean);
+  let provider = 'horde';
+  if (tokens.length && (tokens[0].toLowerCase() === 'horde' || getProvider(tokens[0].toLowerCase()))) provider = tokens.shift().toLowerCase();
+  await showModels({ provider, filter: tokens.join(' ') });
+}
+
+// ---------- Commandes ----------
 async function command(input) {
-  if (input === '/help') help();
+  if (input === '/help') help(S.favs);
   else if (input === '/clear') {
     S.messages = [{ role: 'system', content: buildSystem() }];
     S.pending = []; saveSession();
     S.last = null;
     show();
   }
-  else if (input === '/live') await showModels(false);
-  else if (/^\/[1-4]$/.test(input)) await useModel(FAVORITES[+input[1] - 1]);
-  else if (input === "/5") await useModel(await pickStrongest());
+  else if (input === '/live' || input.startsWith('/live ')) await liveCommand(input.slice(5));
+  else if (input === '/top') await useModel(await pickStrongest());
+  else if (/^\/\d+$/.test(input)) {
+    const m = S.favs[+input.slice(1) - 1];
+    if (m) await useModel(m); else console.log(chalk.red(`Pas de favori n°${input.slice(1)}. /fav pour la liste.`));
+  }
+  else if (input === '/fav' || input.startsWith('/fav ')) favCommand(input.slice(4));
   else if (input.startsWith('/use ')) {
-    const m = S.models[parseInt(input.slice(5), 10) - 1];
-    if (m) await useModel(m); else console.log(chalk.red('Numéro invalide.'));
+    const arg = input.slice(5).trim();
+    const m = /^\d+$/.test(arg) ? S.models[+arg - 1] : refFromArgs(arg.split(/\s+/));
+    if (m) await useModel(m); else console.log(chalk.red('Numéro invalide. Usage : /use <n°> ou /use <fournisseur> <modèle>'));
   }
   else if (input === '/auto') { S.auto = !S.auto; show(); }
   else if (/^\d+$/.test(input)) {
     const m = S.models[+input - 1];
     if (m) await useModel(m); else console.log(chalk.red('Numéro invalide.'));
   }
+  else if (input === '/api' || input.startsWith('/api ')) await apiCommand(input.slice(4));
+  else if (input === '/apihorde' || input.startsWith('/apihorde ')) keyCommand('horde', input.slice(9));
+  else if (input === '/apisearch' || input.startsWith('/apisearch ')) keyCommand('search', input.slice(10));
   else if (input.startsWith('/cd ')) {
     try { process.chdir(expand(input.slice(4).trim())); show(); }
     catch (e) { console.log(chalk.red(e.message)); }
@@ -72,7 +303,16 @@ async function command(input) {
   }
   else if (input === '/save') save();
   else if (input.startsWith('/file ')) await sendFile(input.slice(6));
+  else if (/^\/[a-z0-9]+(\s|$)/i.test(input)) console.log(chalk.red('Commande inconnue. /help pour la liste.'));
   else await askAI(input);
+}
+
+// Exécute une action en marquant le programme comme occupé (les lignes tapées pendant ce temps sont ignorées)
+async function guarded(fn) {
+  busy = true;
+  try { await fn(); }
+  catch (e) { console.log(chalk.red('✘ ' + e.message)); }
+  finally { busy = false; }
 }
 
 show();
@@ -81,24 +321,50 @@ if (restored) console.log(chalk.green(`↺ Conversation reprise (${restored} mes
 prompt();
 rl.on('close', () => process.exit(0));
 
+// Ctrl+C : interrompt l'IA si elle travaille ; sinon il faut le faire 2 fois de suite pour quitter
+rl.on('SIGINT', () => {
+  const now = Date.now();
+  if (buffer !== null) {
+    buffer = null;
+    console.log(chalk.gray('\nSaisie multi-lignes annulée.'));
+    return prompt();
+  }
+  if (now - lastSigint < 2000) { console.log(); process.exit(0); }
+  lastSigint = now;
+  if (busy) return interrupt();
+  console.log(chalk.yellow('\nCtrl+C encore une fois pour quitter (ou /exit).'));
+  prompt();
+});
+
 rl.on('line', async (raw) => {
   const input = raw.trim();
   if (buffer !== null) {
     if (input === '/end') {
       const t = buffer.join('\n');
       buffer = null;
-      if (t) await askAI(t);
+      if (t) await guarded(() => askAI(t));
       prompt();
     } else buffer.push(raw);
     return;
   }
-  if (!input) return prompt();
   if (input === '/exit') process.exit(0);
+  if (input === '/stop') {
+    if (busy) interrupt(); else console.log(chalk.gray('Rien à interrompre.'));
+    return;
+  }
+  if (busy) {
+    if (input === '/auto') {
+      S.auto = !S.auto;
+      console.log(chalk.yellow(`Mode auto : ${S.auto ? 'ON' : 'OFF'}`));
+    } else if (input) console.log(chalk.yellow("⏳ L'IA travaille… /stop pour l'interrompre."));
+    return;
+  }
+  if (!input) return prompt();
   if (input === '/paste') {
     buffer = [];
     console.log(chalk.gray('Colle ton texte, puis tape /end sur une ligne seule.'));
     return;
   }
-  await command(input);
+  await guarded(() => command(input));
   prompt();
 });

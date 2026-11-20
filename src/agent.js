@@ -5,36 +5,78 @@ import readline from 'readline';
 import chalk from 'chalk';
 import { searchWeb } from './search_tool.js';
 import { FAVORITES, MAX_STEPS } from './config.js';
-import { chat, liveModels, getFinishReason } from './api.js';
+import { getFavorites, getSearchKey, SETTINGS_FILE } from './settings.js';
+import { chat, liveModels, listModels, getFinishReason } from './api.js';
+import { parseRef, makeRef, shortName } from './models.js';
 import { spinner, printReply } from './ui.js';
 import { buildSystem } from './context.js';
-import { extractBlocks, expand, writeFile, run, isDangerous, isReadOnly } from './exec.js';
+import { extractBlocks, expand, writeFile, run, killRunning, isDangerous, isReadOnly } from './exec.js';
 
+const favs = getFavorites(FAVORITES);
 export const S = {
-  model: FAVORITES[0], models: [...FAVORITES], auto: false, pending: [], last: null,
+  model: favs[0], models: [...favs], favs, auto: false, pending: [], last: null,
+  stopped: false, ctrl: null,
   messages: [{ role: 'system', content: buildSystem() }]
 };
 const tried = new Set();
 const MEM_PATH = expand('~/.ia_memory.json');
 const SESS = os.homedir() + '/.horde_session.json';
 
-const CMDS = ['/help', '/live', '/use ', '/file ', '/paste', '/cd ', '/auto', '/save', '/clear', '/exit', '/1', '/2', '/3', '/4', '/5'];
-const completer = (l) => { const h = CMDS.filter(c => c.startsWith(l)); return [h.length ? h : CMDS, l]; };
+const BASE_CMDS = ['/help', '/live', '/use ', '/top', '/fav ', '/file ', '/paste', '/cd ', '/auto', '/stop', '/api ', '/apihorde ', '/apisearch ', '/save', '/clear', '/exit'];
+const completer = (l) => {
+  const all = [...BASE_CMDS, ...S.favs.map((_, i) => `/${i + 1}`)];
+  const h = all.filter(c => c.startsWith(l));
+  return [h.length ? h : all, l];
+};
 export const rl = readline.createInterface({ input: process.stdin, output: process.stdout, completer });
-export const ask = (q) => new Promise(r => rl.question(q, a => r(a.trim().toLowerCase())));
 
-export async function showModels(unavailable) {
+// Question o/N : peut être annulée par /stop ou Ctrl+C
+let askAbort = null;
+// raw = true : réponse telle quelle (clés API, URL) ; sinon minuscules (réponses o/N)
+export const ask = (q, raw = false) => new Promise((resolve) => {
+  const ac = new AbortController();
+  askAbort = () => ac.abort();
+  ac.signal.addEventListener('abort', () => { askAbort = null; resolve(raw ? '' : 'n'); }, { once: true });
+  rl.question(q, { signal: ac.signal }, (a) => { askAbort = null; resolve(raw ? a.trim() : a.trim().toLowerCase()); });
+});
+export const askRaw = (q) => ask(q, true);
+
+// Interrompt l'IA : requête en cours, commande en cours, question en attente
+export function interrupt() {
+  S.stopped = true;
+  console.log(chalk.yellow('\n⛔ Interruption…'));
+  S.ctrl?.abort();
+  killRunning();
+  askAbort?.();
+}
+
+// Reconstruit le prompt système (après un changement de clé de recherche, par exemple)
+export function refreshSystem() {
+  S.messages[0] = { role: 'system', content: buildSystem() };
+  saveSession();
+}
+
+const LIST_MAX = 20;
+
+// Liste les modèles d'un fournisseur (AI Horde par défaut), filtrés par mots-clés
+export async function showModels({ provider = 'horde', filter = '', unavailable = false } = {}) {
   try {
-    const list = await liveModels();
-    if (!list.length) return console.log(chalk.red('Aucun modèle actif.'));
-    S.models = list.slice(0, 15);
-    console.log(chalk.cyan.bold(unavailable ? '\n⚠ Modèle indisponible. Choisis avec /use <n> :' : '\n🟢 Modèles en ligne :'));
-    S.models.forEach((m, i) => console.log(chalk.yellow(`  [${i + 1}] `) + chalk.green(m)));
+    let list = await listModels(provider);
+    const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length) list = list.filter(m => words.every(w => m.toLowerCase().includes(w)));
+    if (!list.length) return console.log(chalk.red(words.length ? `Aucun modèle ne correspond à « ${filter} ».` : 'Aucun modèle disponible.'));
+    S.models = list.slice(0, LIST_MAX).map(m => makeRef(provider, m));
+    const where = provider === 'horde' ? 'AI Horde (en ligne)' : provider;
+    console.log(chalk.cyan.bold(unavailable ? '\n⚠ Modèle indisponible. Choisis avec /use <n> :' : `\n🟢 Modèles ${where}${words.length ? ` · « ${filter} »` : ''} :`));
+    S.models.forEach((ref, i) => console.log(chalk.yellow(`  [${i + 1}] `) + chalk.green(parseRef(ref).model)));
+    if (list.length > LIST_MAX) console.log(chalk.gray(`  … ${list.length - LIST_MAX} autres : affine avec /live ${provider} <mot>`));
+    console.log(chalk.gray('  Choisir : /use <n°>'));
   } catch (e) { console.log(chalk.red(`Liste des modèles : ${e.message}`)); }
 }
 
 async function confirm(q) {
   const a = await ask(chalk.yellow(q + ' [o/N/a=toujours] '));
+  if (a === '/stop') { interrupt(); return false; }
   if (a === 'a') { S.auto = true; console.log(chalk.red('Mode auto activé.')); }
   return a === 'o' || a === 'a';
 }
@@ -60,9 +102,15 @@ async function doSearches(reply) {
   const re = /```search\n([\s\S]*?)```/g;
   let m, n = 0;
   while ((m = re.exec(reply)) && n < 3) {
+    if (S.stopped) break;
     const q = m[1].trim();
     if (!q) continue;
     n++;
+    if (!getSearchKey()) {
+      console.log(chalk.yellow("🌐 L'IA veut chercher sur le web, mais aucune clé n'est définie : /apisearch <clé>"));
+      S.pending.push("[Recherche web non activée (aucune clé définie par l'utilisateur) : réponds sans recherche, n'en redemande pas.]");
+      break;
+    }
     console.log(chalk.cyan(`🌐 Recherche web : ${q}`));
     const res = await safeSearch(q);
     S.pending.push(`[Résultats web pour « ${q} » :\n${res}]`);
@@ -70,8 +118,11 @@ async function doSearches(reply) {
 }
 
 async function doFile(b) {
-  const isMem = expand(b.path) === MEM_PATH;
+  const full = expand(b.path);
+  const isMem = full === MEM_PATH;
+  const secret = full === SETTINGS_FILE; // contient les clés API : validation toujours obligatoire
   console.log(chalk.blue(`\n📝 Écrire : ${b.path} (${b.code.split('\n').length} lignes)`));
+  if (secret) console.log(chalk.yellow.bold('🔒 Ce fichier contient tes clés API : validation obligatoire.'));
   if (isMem) {
     try { JSON.parse(b.code); }
     catch (e) {
@@ -80,7 +131,7 @@ async function doFile(b) {
       return;
     }
   }
-  if (!S.auto && !isMem && !(await confirm('Appliquer ?'))) return refuse();
+  if ((secret || (!S.auto && !isMem)) && !(await confirm('Appliquer ?'))) return refuse();
   const r = writeFile(b.path, b.code);
   console.log(chalk.green(`✔ ${r.full}${r.bak ? ' (ancienne version : .bak)' : ''}`));
   S.pending.push(`[Fichier ${b.path} écrit avec succès]`);
@@ -93,14 +144,15 @@ async function doAppends(reply) {
   while ((m = re.exec(reply))) {
     const p = m[1].trim();
     const code = m[2].replace(/\n$/, '');
-    if (expand(p) === MEM_PATH) {
+    const full = expand(p);
+    if (full === MEM_PATH) {
       S.pending.push(`[Append refusé sur ${p} : réécris la mémoire en entier avec un bloc file: en JSON valide.]`);
       continue;
     }
+    const secret = full === SETTINGS_FILE;
     console.log(chalk.blue(`\n➕ Ajouter à : ${p} (${code.split('\n').length} lignes)`));
-    if (!S.auto && !(await confirm('Ajouter ?'))) return refuse();
+    if ((secret || !S.auto) && !(await confirm('Ajouter ?'))) return refuse();
     try {
-      const full = expand(p);
       fs.mkdirSync(path.dirname(full), { recursive: true });
       fs.appendFileSync(full, code + '\n');
       console.log(chalk.green(`✔ ${full} (suite ajoutée)`));
@@ -123,8 +175,10 @@ function doCd(dir) {
 async function doCmd(b) {
   const danger = isDangerous(b.code);
   const safe = isReadOnly(b.code);
+  // Le fichier des clés API ne part jamais vers le serveur sans ta validation
+  const secret = /\.horde_settings/.test(b.code);
   // L'IA peut exiger ta validation en mettant "# CONFIRM" en première ligne du bloc bash
-  const force = /^\s*#\s*CONFIRM\b/i.test(b.code);
+  const force = secret || /^\s*#\s*CONFIRM\b/i.test(b.code);
   if (/(node\s+|\.\/)index\.js/.test(b.code)) {
     console.log(chalk.red('⛔ Refusé : relancerait ce CLI.'));
     S.pending.push('[Refusé : node index.js relance ce CLI interactif. Utilise node --check index.js.]');
@@ -132,8 +186,9 @@ async function doCmd(b) {
   }
   console.log(chalk.blue(safe ? '\n🔍 Lecture :\n' : '\n⚡ Commande :\n') + chalk.white(b.code));
   if (danger) console.log(chalk.red.bold('⛔ Commande dangereuse : confirmation obligatoire.'));
-  if (force) console.log(chalk.yellow.bold('🔒 L\'IA demande ta validation pour cette commande.'));
-  const skip = !force && !danger && (safe || S.auto || /^node\s+~\/horde-cli\/search_tool\.js/.test(b.code.trim()));
+  if (secret) console.log(chalk.yellow.bold('🔒 Ce fichier contient tes clés API : validation obligatoire.'));
+  else if (force) console.log(chalk.yellow.bold("🔒 L'IA demande ta validation pour cette commande."));
+  const skip = !force && !danger && (safe || S.auto);
   if (!skip && !(await confirm('Exécuter ?'))) return refuse();
   const cd = b.code.trim().match(/^cd\s+(.+)$/);
   if (cd) return doCd(cd[1]);
@@ -145,16 +200,17 @@ async function doCmd(b) {
 async function handleBlocks(reply) {
   await doSearches(reply);
   for (const b of extractBlocks(reply)) {
+    if (S.stopped) break;
     if (b.type === 'file') await doFile(b);
     else await doCmd(b);
-    if (S.refused) break;
+    if (S.refused || S.stopped) break;
   }
-  if (!S.refused) await doAppends(reply);
+  if (!S.refused && !S.stopped) await doAppends(reply);
 }
 
 export async function askAI(input, depth = 0, retry = false) {
   // Nouveau message de l'utilisateur : on repart avec une liste de modèles essayés vide
-  if (depth === 0 && !retry) tried.clear();
+  if (depth === 0 && !retry) { tried.clear(); S.stopped = false; }
   const prev = S.pending;
   S.pending = [];
   S.refused = false;
@@ -163,16 +219,24 @@ export async function askAI(input, depth = 0, retry = false) {
     S.messages = [S.messages[0], ...S.messages.slice(-12)];
     while (S.messages[1] && S.messages[1].role !== 'user') S.messages.splice(1, 1);
   }
-  const stop = spinner(S.model.split('/').pop());
+  const stop = spinner(shortName(S.model));
+  let replied = false;
   try {
-    const reply = await chat(S.model, S.messages);
+    S.ctrl = new AbortController();
+    const reply = await chat(S.model, S.messages, S.ctrl.signal);
     const cut = getFinishReason() === 'length';
     stop();
+    if (S.stopped) { const e = new Error('Interrompu'); e.interrupted = true; throw e; }
     if (!reply) throw new Error('Réponse vide.');
     S.messages.push({ role: 'assistant', content: reply });
+    replied = true;
     S.last = null; tried.clear(); saveSession();
     printReply(reply);
     await handleBlocks(reply);
+    if (S.stopped) {
+      S.pending.push("[L'utilisateur t'a interrompu avec /stop : arrête ce que tu faisais et attends ses instructions.]");
+      return;
+    }
     if (cut) {
       console.log(chalk.yellow('✂ Réponse coupée par la limite de tokens.'));
       S.pending.push("[Ta réponse a été coupée (limite de tokens) : un bloc incomplet n'a PAS été exécuté. Reprends en blocs plus courts : file:chemin pour la 1re partie, puis append:chemin pour la suite, une partie par réponse.]");
@@ -183,11 +247,17 @@ export async function askAI(input, depth = 0, retry = false) {
     }
   } catch (e) {
     stop();
+    if (replied) { console.log(chalk.red(`✘ ${e.message}`)); return; }
     S.messages.pop();
+    if (e.interrupted || S.stopped) {
+      S.pending = [...prev, "[L'utilisateur t'a interrompu avec /stop avant ta réponse.]"];
+      S.last = null;
+      return;
+    }
     S.pending = prev;
     S.last = S.last || input;
     console.log(chalk.red(`✘ ${e.status ? `Erreur API (${e.status}) : ` : ''}${e.message}`));
-    if ([403, 404, 503].includes(e.status) && await failover(e, depth)) return;
+    if (parseRef(S.model).provider === 'horde' && [403, 404, 503].includes(e.status) && await failover(e, depth)) return;
   }
 }
 

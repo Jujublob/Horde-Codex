@@ -6,18 +6,19 @@ import { fileURLToPath } from 'url';
 import chalk from 'chalk';
 import { buildSystem } from './context.js';
 import { FAVORITES, MAX_FILE_CHARS } from './config.js';
+import { DEFAULT_CLOUD_LIMITS } from './models.js';
 import { banner, help } from './ui.js';
 import { expand, run } from './exec.js';
-import { getHordeKey, getSearchKey, setHordeKey, setSearchKey, keySource, maskKey, setFavorites, getProviders, getProvider, setProvider, removeProvider } from './settings.js';
-import { S, rl, askAI, askRaw, showModels, saveSession, loadSession, pickStrongest, interrupt, refreshSystem } from './agent.js';
+import { getHordeKey, getSearchKey, setHordeKey, setSearchKey, keySource, maskKey, setFavorites, getProviders, getProvider, setProvider, removeProvider, getLastModel, setLastModel } from './settings.js';
+import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, pickStrongest, interrupt, refreshSystem, maybeWarnCloud } from './agent.js';
 import { listModels } from './api.js';
-import { PRESETS, PRESET_ALIASES, parseRef, makeRef } from './models.js';
+import { PRESETS, PRESET_ALIASES, parseRef, makeRef, iconFor } from './models.js';
 
 let buffer = null;
 let busy = false;
 let lastSigint = 0;
 
-const show = () => banner(S.model, S.auto, { search: !!getSearchKey() });
+const show = () => banner(S.model, S.auto, { search: !!getSearchKey(), simple: S.simple });
 const prompt = () => {
   const dir = process.cwd().split('/').pop() || '/';
   rl.setPrompt(chalk.cyan.bold(`\n${dir}${S.auto ? " [AUTO]" : ""} ❯ `));
@@ -39,12 +40,24 @@ function refFromArgs(tokens) {
 
 async function useModel(m) {
   S.model = m;
+  setLastModel(parseRef(m).provider, m);
+  maybeWarnCloud(m);
+  refreshSystem();
   show();
   console.log(chalk.green('✔ Modèle : ' + label(m)));
   if (S.last) await askAI(S.last);
 }
 
 // ---------- Fichiers (découpés en parties pour respecter le budget de tokens) ----------
+// Taille d'une partie envoyée par /file : généreuse pour les fournisseurs cloud (gros contexte),
+// plus stricte pour AI Horde (petit contexte, voir config.js).
+function fileChunkSize() {
+  if (parseRef(S.model).provider === 'horde') return MAX_FILE_CHARS;
+  const p = getProvider(parseRef(S.model).provider);
+  const limits = p?.limits || DEFAULT_CLOUD_LIMITS;
+  return Math.floor(limits.prompt * 2.5); // large marge, laissée à fitToTokenBudget pour l'ajustement fin
+}
+
 function splitParts(text, size) {
   const parts = [];
   let cur = '';
@@ -72,7 +85,7 @@ async function sendFile(arg) {
     console.log(chalk.red('Fichier introuvable : ' + p));
     return;
   }
-  const parts = splitParts(fs.readFileSync(p, 'utf-8'), MAX_FILE_CHARS);
+  const parts = splitParts(fs.readFileSync(p, 'utf-8'), fileChunkSize());
   if (part < 1 || part > parts.length) {
     console.log(chalk.red(`Ce fichier n'a que ${parts.length} partie(s).`));
     return;
@@ -100,8 +113,10 @@ function save() {
 // ---------- Modèles favoris ----------
 function showFavs() {
   console.log(chalk.hex('#c084fc').bold('\n Modèles favoris'));
-  S.favs.forEach((m, i) => console.log(
-    `  ${chalk.hex('#fbbf24')(`/${i + 1}`.padEnd(5))}${m === S.model ? chalk.green('● ') : '  '}${chalk.hex('#34d399')(label(m))}`));
+  S.favs.forEach((m, i) => {
+    const { sym, color } = iconFor(m);
+    console.log(`  ${chalk.hex('#fbbf24')(`/${i + 1}`.padEnd(5))}${m === S.model ? chalk.green('● ') : '  '}${chalk.hex(color)(sym)} ${chalk.hex('#34d399')(label(m))}`);
+  });
   console.log(chalk.gray('\n  /fav add [n°|nom] · /fav del <n°> · /fav reset\n'));
 }
 
@@ -268,10 +283,26 @@ async function liveCommand(arg) {
 async function command(input) {
   if (input === '/help') help(S.favs);
   else if (input === '/clear') {
-    S.messages = [{ role: 'system', content: buildSystem() }];
+    S.messages = [{ role: 'system', content: buildSystem(parseRef(S.model).provider, S.simple) }];
     S.pending = []; saveSession();
     S.last = null;
     show();
+    const memPath = expand('~/.ia_memory.json');
+    if (fs.existsSync(memPath)) {
+      const a = await ask(chalk.yellow('Vider aussi la mémoire persistante (~/.ia_memory.json) ? [o/N] '));
+      if (a === 'o') {
+        try { fs.unlinkSync(memPath); refreshSystem(); console.log(chalk.green('✔ Mémoire persistante vidée.')); }
+        catch (e) { console.log(chalk.red('✘ ' + e.message)); }
+      }
+    }
+  }
+  else if (input === '/assistant') {
+    S.simple = !S.simple;
+    refreshSystem();
+    show();
+    console.log(S.simple
+      ? chalk.yellow('Mode assistant : juste parler et chercher sur le web (ddgr), aucun accès au système.')
+      : chalk.green('Mode agent complet rétabli.'));
   }
   else if (input === '/live' || input.startsWith('/live ')) await liveCommand(input.slice(5));
   else if (input === '/top') await useModel(await pickStrongest());
@@ -282,8 +313,16 @@ async function command(input) {
   else if (input === '/fav' || input.startsWith('/fav ')) favCommand(input.slice(4));
   else if (input.startsWith('/use ')) {
     const arg = input.slice(5).trim();
-    const m = /^\d+$/.test(arg) ? S.models[+arg - 1] : refFromArgs(arg.split(/\s+/));
-    if (m) await useModel(m); else console.log(chalk.red('Numéro invalide. Usage : /use <n°> ou /use <fournisseur> <modèle>'));
+    const tokens = arg.split(/\s+/).filter(Boolean);
+    const bareProvider = tokens.length === 1 && (tokens[0] === 'horde' || getProvider(tokens[0])) ? tokens[0] : null;
+    let m = null;
+    if (/^\d+$/.test(arg)) m = S.models[+arg - 1];
+    else if (bareProvider) {
+      m = getLastModel(bareProvider);
+      if (!m) console.log(chalk.yellow(`Aucun modèle mémorisé pour ${bareProvider}. /live ${bareProvider} pour en choisir un.`));
+    } else m = refFromArgs(tokens);
+    if (m) await useModel(m);
+    else if (!bareProvider) console.log(chalk.red('Numéro invalide. Usage : /use <n°>, /use <fournisseur> (dernier utilisé) ou /use <fournisseur> <modèle>'));
   }
   else if (input === '/auto') { S.auto = !S.auto; show(); }
   else if (/^\d+$/.test(input)) {

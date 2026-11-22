@@ -1,6 +1,6 @@
 {
-  "name": "horde-codex",
-  "version": "1.0.0",
+  "name": "hordecli",
+  "version": "1.7.0",
   "type": "module",
   "main": "index.js",
   "scripts": {

@@ -3,7 +3,7 @@ import os from 'os';
 import readline from 'readline';
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
-import { parseRef } from './models.js';
+import { parseRef, iconFor } from './models.js';
 
 marked.use(markedTerminal());
 
@@ -38,7 +38,7 @@ export function banner(model, auto, opts = {}) {
 
   const home = os.homedir();
   const cwd = process.cwd().startsWith(home) ? '~' + process.cwd().slice(home.length) : process.cwd();
-  const title = gradient('◆ HORDE CODEX', '#c084fc', '#38bdf8');
+  const title = gradient('◆ HORDECLI', '#c084fc', '#38bdf8');
 
   console.log(bd('╭' + '─'.repeat(inner) + '╮'));
   console.log(row(body >= 37 ? title + dim('  ·  ') + chalk.hex('#38bdf8')('Agent Terminal IA') : title));
@@ -46,14 +46,17 @@ export function banner(model, auto, opts = {}) {
   const ref = parseRef(model);
   const mname = ref.model.split('/').pop();
   const tag = ref.provider === 'horde' ? '' : dim('  ' + ref.provider);
-  console.log(kv('Modèle', fit(chalk.hex('#34d399').bold(clip(mname, vw - (tag ? vis(tag) : 0))), tag, vw)));
+  const { sym, color } = iconFor(model);
+  const iconPart = chalk.hex(color)(sym) + ' ';
+  console.log(kv('Modèle', fit(iconPart + chalk.hex('#34d399').bold(clip(mname, vw - 2 - (tag ? vis(tag) : 0))), tag, vw)));
   console.log(kv('Dossier', chalk.hex('#60a5fa')(clipLeft(cwd, vw))));
   console.log(kv('Mode', auto
     ? fit(chalk.hex('#f87171').bold('● AUTO'), dim('  sans confirmation'), vw)
     : fit(chalk.hex('#34d399')('● Sécurisé'), dim('  confirmation demandée'), vw)));
   console.log(kv('Recherche', opts.search
-    ? chalk.hex('#34d399')('● activée')
-    : fit(dim('○ désactivée'), dim('  /apisearch <clé>'), vw)));
+    ? fit(chalk.hex('#34d399')('● via API'), dim('  + ddgr'), vw)
+    : chalk.hex('#34d399')('● ddgr (sans clé)')));
+  if (opts.simple) console.log(kv('Mode', chalk.hex('#fbbf24')('◇ Assistant (chat + recherche seulement)')));
   console.log(kv('Aide', fit(chalk.hex('#fbbf24')('/help'), dim('  ·  ') + chalk.hex('#fbbf24')('/stop') + dim(' interrompt l’IA'), vw)));
   console.log(bd('╰' + '─'.repeat(inner) + '╯'));
 }
@@ -79,13 +82,17 @@ export function spinner(label) {
   };
 }
 
+// Les blocs file:/append:/search sont nos conventions internes, pas des langages réels : les
+// réécrire évite que le rendu plante en cherchant un surligneur pour "file:~/chemin".
+const sanitizeFences = (md) => md.replace(/```(?:file|append|search)(?::[^\n]*)?\n/g, '```\n');
+
 export function printReply(reply) {
   const w = Math.min(process.stdout.columns || 60, 72);
   const bar = chalk.hex('#334155')('─'.repeat(w));
   console.log('');
   console.log(chalk.hex('#c084fc')(' ✦ ') + chalk.hex('#38bdf8').bold('Assistant'));
   console.log(bar);
-  console.log(marked.parse(reply).trim());
+  console.log(marked.parse(sanitizeFences(reply)).trim());
   console.log(bar + '\n');
 }
 
@@ -112,7 +119,10 @@ export function help(favs = []) {
   row('/api del <id>', 'Retirer un fournisseur');
   row('/api test <id>', 'Tester la connexion');
   row('/live <id> [mots]', 'Chercher un modèle (ex : /live gemini flash)');
-  row('/use <id> <modèle>', 'Utiliser un modèle précis');
+  row('/use <id> [modèle]', 'Utiliser un modèle (sans nom = dernier utilisé)');
+
+  section('Mode');
+  row('/assistant', 'Bascule : juste parler + chercher (ddgr), sans accès au système');
 
   section('Contrôle de l’IA');
   row('/stop', 'Interrompre l’IA (même en mode auto)');

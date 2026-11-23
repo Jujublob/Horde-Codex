@@ -19,7 +19,7 @@ let buffer = null;
 let busy = false;
 let lastSigint = 0;
 
-const show = () => banner(S.model, S.auto, { search: !!getSearchKey(), simple: S.simple });
+const show = () => banner(S.model, S.auto, { search: !!getSearchKey(), simple: S.simple, conv: S.convId });
 const prompt = () => {
   const dir = process.cwd().split('/').pop() || '/';
   rl.setPrompt(chalk.cyan.bold(`\n${dir}${S.auto ? " [AUTO]" : ""} ❯ `));

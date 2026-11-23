@@ -43,6 +43,7 @@ export function banner(model, auto, opts = {}) {
   console.log(bd('╭' + '─'.repeat(inner) + '╮'));
   console.log(row(body >= 37 ? title + dim('  ·  ') + chalk.hex('#38bdf8')('Agent Terminal IA') : title));
   console.log(bd('├' + '─'.repeat(inner) + '┤'));
+  if (opts.conv != null) console.log(kv('Conversation', chalk.yellow('#' + opts.conv) + dim('   /resume · /new · /delconv <n°>')));
   const ref = parseRef(model);
   const mname = ref.model.split('/').pop();
   const tag = ref.provider === 'horde' ? '' : dim('  ' + ref.provider);
@@ -123,6 +124,12 @@ export function help(favs = []) {
 
   section('Mode');
   row('/assistant', 'Bascule : juste parler + chercher (ddgr), sans accès au système');
+
+  section('Conversations (mémoire séparée par conversation)');
+  row('/resume', 'Lister toutes les conversations');
+  row('/resume <n°>', 'Reprendre une conversation (avec sa mémoire)');
+  row('/new', 'Nouvelle conversation (numéro automatique, jamais réutilisé)');
+  row('/delconv <n°>', 'Supprimer une conversation ET son fichier mémoire');
 
   section('Contrôle de l’IA');
   row('/stop', 'Interrompre l’IA (même en mode auto)');

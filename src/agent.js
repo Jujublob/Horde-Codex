@@ -5,7 +5,7 @@ import readline from 'readline';
 import chalk from 'chalk';
 import { searchWeb } from './search_tool.js';
 import { FAVORITES, MAX_STEPS, NON_HORDE_MAX_STEPS } from './config.js';
-import { getFavorites, getSearchKey, SETTINGS_FILE } from './settings.js';
+import { getFavorites, getSearchKey, getProviders, getLastModel, setLastModel, SETTINGS_FILE } from './settings.js';
 import { chat, liveModels, listModels, getFinishReason } from './api.js';
 import { parseRef, makeRef, shortName, iconFor } from './models.js';
 import { spinner, printReply } from './ui.js';
@@ -343,7 +343,7 @@ export async function askAI(input, depth = 0, retry = false) {
     S.pending = prev;
     S.last = S.last || input;
     console.log(chalk.red(`✘ ${e.status ? `Erreur API (${e.status}) : ` : ''}${e.message}`));
-    if (parseRef(S.model).provider === 'horde' && [403, 404, 503].includes(e.status) && await failover(e, depth)) return;
+    if (parseRef(S.model).provider === 'horde' && ([403, 404, 503].includes(e.status) || isProviderDown(e)) && await failover(e, depth)) return;
   }
 }
 
@@ -355,15 +355,66 @@ async function failover(e, depth) {
   tried.add(S.model);
   const max = e.status === 403 ? 14 : 40;
   let list;
-  try { list = await liveModels(); } catch { return false; }
+  try { list = await liveModels(); } catch { return providerFailover(e, depth); }
   const ok = list.filter(m => !tried.has(m) && sizeOf(m) >= 7 && sizeOf(m) <= max)
     .sort((a, b) => score(b) - score(a) || sizeOf(b) - sizeOf(a));
-  if (!ok.length) { console.log(chalk.red('Aucun modèle de remplacement. Réessaie plus tard.')); return false; }
+  if (!ok.length) return providerFailover(e, depth);
   S.model = ok[0];
   console.log(chalk.yellow(`↻ Bascule auto vers ${S.model.split('/').pop()}`));
   if (sizeOf(S.model) > 0 && sizeOf(S.model) < 20) console.log(chalk.yellow('⚠ Modèle plus petit : risque d\'erreurs accru sur du code complexe.'));
   await askAI(S.last, depth, true);
   return true;
+}
+
+// ---------- Bascule entre fournisseurs (IA gratuite locale, style FreeLLMAPI — sans le serveur) ----------
+// Quand AI Horde n'a plus aucun modèle disponible (panne, quota, saturé), on propose à l'utilisateur
+// de continuer avec un AUTRE fournisseur qu'il a configuré (/api add). Seuls les fournisseurs réellement
+// enregistrés apparaissent dans le choix — si Gemini n'est pas ajouté, il n'est pas proposé.
+const PROVIDER_HINTS = {
+  horde: 'AI Horde', gemini: 'Gemini', openai: 'ChatGPT', claude: 'Claude',
+  openrouter: 'OpenRouter', groq: 'Groq', mistral: 'Mistral', deepseek: 'DeepSeek', together: 'Together'
+};
+// Erreurs qui signifient "ce fournisseur ne répondra pas" : quota dépassé, interdiction, panne, timeout
+const isProviderDown = (e) => [402, 403, 429, 500, 502, 503, 504].includes(e?.status) || /timeout|ECONN|network|fetch failed/i.test(e?.message || '');
+
+async function providerFailover(e, depth) {
+  const current = parseRef(S.model).provider;
+  // On ne bascule que depuis AI Horde : pour les autres fournisseurs, c'est l'utilisateur qui gère ses clés.
+  if (current !== 'horde') return false;
+  const others = Object.entries(getProviders()).filter(([id, p]) => p && p.baseUrl);
+  if (!others.length) {
+    console.log(chalk.red('Aucun modèle de remplacement. Réessaie plus tard (ou /api add pour configurer un autre fournisseur : le programme pourra te proposer de basculer).'));
+    return false;
+  }
+  console.log(chalk.yellow(`\n⚠ AI Horde ne répond pas (${e.status || e.message}).`));
+  console.log(chalk.hex('#c084fc').bold('Choisis un autre fournisseur pour continuer cette conversation :'));
+  others.forEach(([id, p], i) => {
+    const last = getLastModel(id);
+    console.log(`  ${chalk.yellow(`[${i + 1}]`)} ${p.name || PROVIDER_HINTS[id] || id}${last ? chalk.gray(' — dernier modèle utilisé : ' + shortName(last)) : chalk.gray(' — aucun modèle choisi (il faudra /use ' + id + ' <modèle>)')}`);
+  });
+  console.log(`  ${chalk.gray('[Entrée = garder AI Horde et réessayer plus tard]')}\n`);
+  const n = parseInt(await askRaw(chalk.cyan('Numéro (vide = annuler) : ')), 10);
+  if (!(n >= 1 && n <= others.length)) return false;
+  const [id] = others[n - 1];
+  const ref = getLastModel(id);
+  if (!ref) {
+    console.log(chalk.gray(`Fournisseur ${id} sélectionné mais aucun modèle mémorisé.`));
+    console.log(chalk.gray(`Affiche la liste avec /live ${id}, choisis avec /use ${id} <modèle>, puis renvoie ton dernier message.`));
+    S.last = S.last || null;
+    return true; // erreur déjà expliquée : on ne l'affiche pas une seconde fois
+  }
+  console.log(chalk.green(`↪ Bascule vers ${PROVIDER_HINTS[id] || id} (${shortName(ref)}) — la conversation est conservée.`));
+  await useModelFromAgent(ref);
+  await askAI(S.last, depth, true);
+  return true;
+}
+
+// Change de modèle depuis ce module (même chemin que /use dans index.js)
+async function useModelFromAgent(ref) {
+  S.model = ref;
+  setLastModel(parseRef(ref).provider, ref);
+  maybeWarnCloud(ref);
+  refreshSystem();
 }
 
 // ---------- Conversations (dossier ~/.horde-cli-memoire/, hors du programme) ----------

@@ -23,3 +23,24 @@ export function parseRef(ref) {
 }
 
 export const shortName = (ref) => parseRef(ref).model.split('/').pop();
+
+// Budgets par défaut des fournisseurs "cloud" (gros contextes), utilisés notamment pour la
+// taille des parties envoyées par /file. AI Horde reste volontairement petit (voir api.js).
+export const DEFAULT_CLOUD_LIMITS = { prompt: 16000, reply: 4096 };
+
+// Icône et couleur affichées devant un modèle selon son fournisseur (bandeau, listes, favoris).
+export function iconFor(ref) {
+  const { provider, model } = parseRef(ref);
+  if (provider !== HORDE) {
+    if (provider === 'gemini') return { sym: '✦', color: '#38bdf8' };
+    if (provider === 'openai') return { sym: '❋', color: '#34d399' };
+    if (provider === 'claude') return { sym: '✳', color: '#f59e0b' };
+    return { sym: '◆', color: '#a78bfa' }; // autres fournisseurs configurés
+  }
+  const m = (model || '').toLowerCase();
+  if (m.includes('qwen')) return { sym: '❖', color: '#34d399' };
+  if (m.includes('mistral')) return { sym: '™', color: '#fb923c' };
+  if (m.includes('llama')) return { sym: 'λ', color: '#60a5fa' };
+  if (m.includes('gemma')) return { sym: '◉', color: '#fbbf24' };
+  return { sym: '⬡', color: '#94a3b8' }; // AI Horde, modèle non reconnu
+}

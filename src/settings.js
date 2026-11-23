@@ -78,3 +78,15 @@ export function removeProvider(id) {
   save();
   return existed;
 }
+
+// ---------- Dernier modèle utilisé, mémorisé par fournisseur (/use <fournisseur> sans nom) ----------
+export function getLastModel(provider) {
+  const m = load().lastModels;
+  return m && typeof m === 'object' ? (m[provider] || null) : null;
+}
+
+export function setLastModel(provider, ref) {
+  const s = load();
+  s.lastModels = { ...(s.lastModels && typeof s.lastModels === 'object' ? s.lastModels : {}), [provider]: ref };
+  save();
+}

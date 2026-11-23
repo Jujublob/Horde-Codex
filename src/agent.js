@@ -9,23 +9,27 @@ import { getFavorites, getSearchKey, SETTINGS_FILE } from './settings.js';
 import { chat, liveModels, listModels, getFinishReason } from './api.js';
 import { parseRef, makeRef, shortName, iconFor } from './models.js';
 import { spinner, printReply } from './ui.js';
-import { buildSystem } from './context.js';
+import { buildSystem, setActiveConversation, activeConversationId } from './context.js';
+import { sessionPath, memoryPath, globalMemoryPath, defaultConversationId, createConversation, listConversations, loadMeta, touchMeta, autoTitle, deleteConversation } from './convos.js';
 import { extractBlocks, expand, writeFile, run, killRunning, isDangerous, isReadOnly, checkSyntax } from './exec.js';
 
 const favs = getFavorites(FAVORITES);
 export const S = {
   model: favs[0], models: [...favs], favs, auto: false, pending: [], last: null,
-  stopped: false, ctrl: null, simple: false,
+  stopped: false, ctrl: null, simple: false, convId: null,
   messages: [{ role: 'system', content: buildSystem(parseRef(favs[0]).provider) }]
 };
 const tried = new Set();
 // Commandes de lecture déjà exécutées dans la suite d'étapes en cours (évite les boucles de
 // re-vérification des mêmes fichiers) ; remise à zéro à chaque nouveau message de l'utilisateur.
 const seenCmds = new Map();
-const MEM_PATH = expand('~/.ia_memory.json');
-const SESS = os.homedir() + '/.horde_session.json';
+// Chemins des fichiers de mémoire reconnus automatiquement (validés sans confirmation, JSON obligatoire) :
+// la mémoire de la conversation courante + la mémoire globale. Les "mémoires de projet" libres
+// ne sont plus demandées par le prompt : tout passe par ces deux fichiers, hors du dossier du programme.
+const memoryTargets = () => [memoryPath(S.convId), globalMemoryPath()].filter(Boolean);
+const isMemoryFile = (full) => memoryTargets().includes(full);
 
-const BASE_CMDS = ['/help', '/live', '/use ', '/top', '/fav ', '/file ', '/paste', '/cd ', '/auto', '/assistant', '/stop', '/api ', '/apihorde ', '/apisearch ', '/save', '/clear', '/exit'];
+const BASE_CMDS = ['/help', '/live', '/use ', '/top', '/fav ', '/file ', '/paste', '/cd ', '/auto', '/assistant', '/stop', '/api ', '/apihorde ', '/apisearch ', '/save', '/clear', '/resume', '/new', '/delconv ', '/exit'];
 const completer = (l) => {
   const all = [...BASE_CMDS, ...S.favs.map((_, i) => `/${i + 1}`)];
   const h = all.filter(c => c.startsWith(l));
@@ -141,7 +145,7 @@ async function doFile(b) {
     return;
   }
   const full = expand(b.path);
-  const isMem = full === MEM_PATH;
+  const isMem = isMemoryFile(full);
   const secret = full === SETTINGS_FILE; // contient les clés API : validation toujours obligatoire
   console.log(chalk.blue(`\n📝 Écrire : ${b.path} (${b.code.split('\n').length} lignes)`));
   if (secret) console.log(chalk.yellow.bold('🔒 Ce fichier contient tes clés API : validation obligatoire.'));
@@ -194,7 +198,7 @@ async function doAppends(reply) {
     const p = m[1].trim();
     const code = m[2].replace(/\n$/, '');
     const full = expand(p);
-    if (full === MEM_PATH) {
+    if (isMemoryFile(full)) {
       S.pending.push(`[Append refusé sur ${p} : réécris la mémoire en entier avec un bloc file: en JSON valide.]`);
       continue;
     }
@@ -284,6 +288,8 @@ async function handleBlocks(reply) {
 export async function askAI(input, depth = 0, retry = false) {
   // Nouveau message de l'utilisateur : on repart avec une liste de modèles essayés vide
   if (depth === 0 && !retry) { tried.clear(); S.stopped = false; seenCmds.clear(); }
+  // Première phrase de la conversation : elle devient son titre (affiché dans /resume)
+  if (S.convId != null && !loadMeta(S.convId)?.title) touchMeta(S.convId, { title: autoTitle(input) });
   const prev = S.pending;
   S.pending = [];
   S.refused = false;
@@ -360,16 +366,102 @@ async function failover(e, depth) {
   return true;
 }
 
+// ---------- Conversations (dossier ~/.horde-cli-memoire/, hors du programme) ----------
+// Chaque conversation a son numéro système (1, 2, 3... jamais réutilisé), sa session et SA mémoire ;
+// la mémoire globale est partagée entre toutes. Supprimer une conversation supprime son dossier entier,
+// donc aussi son fichier mémoire.
+
 export function saveSession() {
-  try { fs.writeFileSync(SESS, JSON.stringify(S.messages)); } catch {}
+  if (S.convId == null) return;
+  try {
+    fs.writeFileSync(sessionPath(S.convId), JSON.stringify(S.messages));
+    touchMeta(S.convId, { model: S.model, messageCount: Math.max(0, S.messages.length - 1) });
+  } catch {}
 }
 
-export function loadSession() {
+// Recharge la session d'une conversation dans S.messages (le prompt système est reconstruit avant)
+export function loadSession(id = S.convId) {
+  if (id == null) return 0;
   try {
-    const m = JSON.parse(fs.readFileSync(SESS, 'utf-8'));
+    const m = JSON.parse(fs.readFileSync(sessionPath(id), 'utf-8'));
     if (Array.isArray(m) && m.length > 1) { m[0] = S.messages[0]; S.messages = m; return m.length - 1; }
   } catch {}
   return 0;
+}
+
+// Change de conversation : sauvegarde l'actuelle, bascule, recharge la nouvelle.
+export function switchConversation(id) {
+  saveSession();
+  S.convId = id;
+  setActiveConversation(id);
+  refreshSystem();
+  return loadSession(id);
+}
+
+export function newConversation() {
+  saveSession();
+  S.convId = createConversation();
+  setActiveConversation(S.convId);
+  S.messages = [{ role: 'system', content: buildSystem(parseRef(S.model).provider, S.simple) }];
+  S.pending = [];
+  S.last = null;
+  seenCmds.clear();
+  return S.convId;
+}
+
+// Au lancement : conversation la plus récente (créée/migrée si besoin), puis reprise de sa session.
+export function initConversations() {
+  S.convId = defaultConversationId();
+  setActiveConversation(S.convId);
+  refreshSystem();
+  return loadSession();
+}
+
+// /resume [n°] : liste les conversations ou bascule sur l'une d'elles
+export async function resumeCommand(arg) {
+  const list = listConversations();
+  if (!list.length) return console.log(chalk.gray('Aucune conversation enregistrée.'));
+  const n = parseInt(String(arg || '').trim(), 10);
+  if (!n) {
+    console.log(chalk.hex('#c084fc').bold('\n Conversations\n'));
+    for (const c of list) {
+      const mark = c.id === S.convId ? chalk.green('● ') : '  ';
+      const when = c.updatedAt ? new Date(c.updatedAt).toLocaleString('fr-FR') : '?';
+      console.log(`  ${mark}${chalk.yellow(`#${c.id}`)} ${chalk.hex('#34d399')(c.title)} ${chalk.gray(`· ${c.messageCount} msg · ${shortName(c.model || S.model)} · ${when}`)}`);
+    }
+    console.log(chalk.gray('\n  Reprendre : /resume <n°> · Nouvelle : /new · Supprimer : /delconv <n°>\n'));
+    return;
+  }
+  if (!list.some(c => c.id === n)) return console.log(chalk.red(`Pas de conversation n°${n}. /resume pour la liste.`));
+  const count = switchConversation(n);
+  console.log(count
+    ? chalk.green(`↺ Conversation #${n} reprise (${count} messages).`)
+    : chalk.green(`↺ Conversation #${n} ouverte (vide).`));
+  return true; // index.js rafraîchira le bandeau
+}
+
+// /new : nouvelle conversation (l'actuelle reste enregistrée, récupérable avec /resume)
+export function newConversationCommand() {
+  const id = newConversation();
+  console.log(chalk.green(`✔ Nouvelle conversation #${id}. L'ancienne reste accessible via /resume.`));
+  return id;
+}
+
+// /delconv <n°> : supprime une conversation ET son fichier mémoire (tout est dans son dossier)
+export async function delConvCommand(arg) {
+  const n = parseInt(String(arg || '').trim(), 10);
+  const list = listConversations();
+  if (!n) return console.log(chalk.red('Usage : /delconv <n°> (/resume pour voir la liste).'));
+  if (!list.some(c => c.id === n)) return console.log(chalk.red(`Pas de conversation n°${n}.`));
+  const meta = loadMeta(n);
+  console.log(chalk.yellow(`⚠ Conversation #${n} « ${meta?.title || '(sans titre)'} » : session ET fichier mémoire seront supprimés définitivement.`));
+  if (!(await confirm('Supprimer ?'))) return;
+  if (!deleteConversation(n)) return console.log(chalk.red('✘ Suppression impossible.'));
+  console.log(chalk.green(`✔ Conversation #${n} supprimée (mémoire incluse). Le numéro ne sera pas réutilisé.`));
+  if (n === S.convId) {
+    const id = newConversation();
+    console.log(chalk.gray(`  (la conversation supprimée était l'active : nouvelle conversation #${id} ouverte)`));
+  }
 }
 
 export async function pickStrongest() {

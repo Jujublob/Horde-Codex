@@ -2,23 +2,32 @@ import fs from 'fs';
 import os from 'os';
 import { SYSTEM_PROMPT, SYSTEM_PROMPT_CLOUD, SEARCH_PROMPT, SIMPLE_PROMPT } from './config.js';
 import { getSearchKey } from './settings.js';
+import { globalMemoryPath, memoryPath } from './convos.js';
 
-const MEM = os.homedir() + '/.ia_memory.json';
+// Conversation active (fixée au lancement / après /resume ou /new) : c'est elle qui détermine
+// quel fichier de mémoire est lu et demandé à l'IA. La mémoire globale (~/.horde-cli-memoire/global.json)
+// est toujours injectée en plus. Les deux vivent hors du dossier du programme.
+let currentConvId = null;
+export function setActiveConversation(id) { currentConvId = id; }
+export function activeConversationId() { return currentConvId; }
 
 // provider : 'horde' (par défaut) ou l'id d'un autre fournisseur (gemini, openai, claude...)
 // simple : true = mode "assistant" (juste parler + chercher, aucun accès au système, voir /assistant)
 export function buildSystem(provider = 'horde', simple = false) {
   if (simple) return SIMPLE_PROMPT;
 
-  let mem = '';
+  const globMem = readMemoryRaw(globalMemoryPath());
+  const convMem = currentConvId != null ? readMemoryRaw(memoryPath(currentConvId)) : '';
   let ls = '';
-  try { mem = fs.readFileSync(MEM, 'utf-8').slice(0, 3000); } catch {}
   try { ls = fs.readdirSync(process.cwd()).slice(0, 40).join(', '); } catch {}
   const isHorde = provider === 'horde';
   const base = isHorde ? SYSTEM_PROMPT : SYSTEM_PROMPT_CLOUD;
   // Ancien mécanisme de recherche par clé API (Tavily), optionnel et réservé à Horde pour ne pas
   // surcharger le prompt des autres fournisseurs qui ont souvent déjà leur propre recherche.
   const search = (isHorde && getSearchKey()) ? '\n' + SEARCH_PROMPT : '';
+  const convLine = currentConvId != null
+    ? `Conversation n°${currentConvId} — mémoire de cette conversation (${memoryPath(currentConvId)}) : ${convMem || '(vide)'}`
+    : '';
   return [
     base + search, '',
     `Dossier courant : ${process.cwd()}`,
@@ -26,7 +35,12 @@ export function buildSystem(provider = 'horde', simple = false) {
     "Contenu du home : " + (() => { try { return fs.readdirSync(os.homedir()).slice(0, 40).join(', '); } catch { return ''; } })(),
     `Contenu : ${ls}`,
     `Date : ${new Date().toLocaleString('fr-FR')}`,
-    `Mémoire (${MEM}) :`,
-    mem || '(vide)'
-  ].join('\n');
+    `Mémoire globale (${globalMemoryPath()}) : ${globMem || '(vide)'}`,
+    convLine
+  ].filter(Boolean).join('\n');
+}
+
+// Lecture directe d'un fichier JSON tronqué (évite une dépendance vers convos.js dans ce sens-là)
+function readMemoryRaw(p, maxChars = 3000) {
+  try { return fs.readFileSync(p, 'utf-8').slice(0, maxChars); } catch { return ''; }
 }

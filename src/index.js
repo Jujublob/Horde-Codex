@@ -10,9 +10,10 @@ import { DEFAULT_CLOUD_LIMITS } from './models.js';
 import { banner, help } from './ui.js';
 import { expand, run } from './exec.js';
 import { getHordeKey, getSearchKey, setHordeKey, setSearchKey, keySource, maskKey, setFavorites, getProviders, getProvider, setProvider, removeProvider, getLastModel, setLastModel } from './settings.js';
-import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, pickStrongest, interrupt, refreshSystem, maybeWarnCloud } from './agent.js';
+import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, initConversations, resumeCommand, newConversationCommand, delConvCommand, pickStrongest, interrupt, refreshSystem, maybeWarnCloud } from './agent.js';
 import { listModels } from './api.js';
 import { PRESETS, PRESET_ALIASES, parseRef, makeRef, iconFor } from './models.js';
+import { memoryPath, globalMemoryPath } from './convos.js';
 
 let buffer = null;
 let busy = false;
@@ -287,15 +288,25 @@ async function command(input) {
     S.pending = []; saveSession();
     S.last = null;
     show();
-    const memPath = expand('~/.ia_memory.json');
-    if (fs.existsSync(memPath)) {
-      const a = await ask(chalk.yellow('Vider aussi la mémoire persistante (~/.ia_memory.json) ? [o/N] '));
+    // La mémoire vit dans le dossier de la conversation courante (~/.horde-cli-memoire/conversations/<n°>/),
+    // plus jamais dans ~/.ia_memory.json : on propose de vider celle de cette conversation.
+    const hasContent = (p) => { try { const t = fs.readFileSync(p, 'utf-8').trim(); return !!t && t !== '{}' && t !== '[]'; } catch { return false; } };
+    const memTargets = [memoryPath(S.convId), globalMemoryPath()].filter(Boolean);
+    const existing = memTargets.filter(hasContent);
+    if (existing.length) {
+      const a = await ask(chalk.yellow('Vider aussi la mémoire de cette conversation ? [o/N] '));
       if (a === 'o') {
-        try { fs.unlinkSync(memPath); refreshSystem(); console.log(chalk.green('✔ Mémoire persistante vidée.')); }
-        catch (e) { console.log(chalk.red('✘ ' + e.message)); }
+        try {
+          for (const p of existing) fs.writeFileSync(p, '{}');
+          refreshSystem();
+          console.log(chalk.green('✔ Mémoire de la conversation vidée (la mémoire globale est conservée ; /resume <n°> pour retrouver les autres conversations).'));
+        } catch (e) { console.log(chalk.red('✘ ' + e.message)); }
       }
     }
   }
+  else if (input === '/resume' || input.startsWith('/resume ')) { if (await resumeCommand(input.slice(7))) show(); }
+  else if (input === '/new') { newConversationCommand(); show(); }
+  else if (input.startsWith('/delconv')) await delConvCommand(input.slice(8));
   else if (input === '/assistant') {
     S.simple = !S.simple;
     refreshSystem();
@@ -355,8 +366,9 @@ async function guarded(fn) {
 }
 
 show();
-const restored = loadSession();
-if (restored) console.log(chalk.green(`↺ Conversation reprise (${restored} messages). /clear pour repartir de zéro.`));
+const restored = initConversations();
+if (restored) console.log(chalk.green(`↺ Conversation #${S.convId} reprise (${restored} messages). /clear pour repartir de zéro, /resume pour changer de conversation.`));
+else console.log(chalk.gray(`Conversation #${S.convId}. /resume : liste des conversations · /new : nouvelle · /delconv <n°> : supprimer.`));
 prompt();
 rl.on('close', () => process.exit(0));
 

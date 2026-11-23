@@ -111,3 +111,10 @@ export function defaultConversationId() {
 export function readMemoryRaw(p, maxChars = 3000) {
   try { return fs.readFileSync(p, 'utf-8').slice(0, maxChars); } catch { return ''; }
 }
+
+// Supprime définitivement une conversation : dossier session + mémoire incluse.
+export function deleteConversation(id) {
+  const dir = convDir(id);
+  if (!fs.existsSync(dir)) return false;
+  try { fs.rmSync(dir, { recursive: true, force: true }); return true; } catch { return false; }
+}

@@ -2,21 +2,28 @@
 
 Numérotation indicative (pas de tags Git officiels tant que tu ne les poses pas toi-même).
 
+## 1.9.0 — Superviseur IA, persistance des agents, suppression du timeout
+- **Suppression du timeout de 120 secondes** : la fonction `run()` dans `exec.js` n'a plus de limite de temps. Les commandes longues (compilations, téléchargements, etc.) peuvent tourner autant que nécessaire. L'interruption reste possible via `/stop` ou Ctrl+C.
+- **Superviseur IA** : un agent spécial qui coordonne d'autres agents.
+  - Commande `/supervise <modèle> "<tâche>"` : lance un superviseur IA qui peut créer, surveiller, arrêter et relancer des sous-agents.
+  - Le superviseur se base sur la mémoire globale de l'utilisateur pour respecter ses préférences.
+  - Il peut envoyer des messages aux agents avec `/agent msg <id> "<message>"`.
+  - Affichage avec 👑 pour identifier le superviseur dans `/agents`.
+- **Persistance des agents dans la conversation** :
+  - Les agents sont sauvegardés dans `agents.json` dans le dossier de la conversation.
+  - `/resume` restaure automatiquement les agents de la conversation reprise (en mode `paused`).
+  - `/agent resume <id>` pour relancer un agent restauré.
+- **Nouvelle commande `/agents watch`** : tableau de bord en temps réel avec rafraîchissement automatique toutes les 2 secondes.
+- **Nouvelle commande `/agent msg <id> "<message>"`** : envoyer un message à un agent en cours d'exécution.
+- **Nouvelle commande `/agent clear-shared`** : effacer la mémoire partagée entre agents.
+
 ## 1.8.0 — Système multi-agents et correction critique
-- **Correction critique de `launch.sh`** : Suppression des chemins codés en dur (`~/horde-codex-portable`). Le script détecte désormais automatiquement son propre répertoire d'exécution et le sous-dossier `src/` si présent. Les utilisateurs peuvent renommer ou déplacer le dossier du programme sans casser le lancement.
-- **Système multi-agents autonome** : Nouveau module permettant de lancer plusieurs agents en tâche de fond, chacun avec sa propre conversation et son propre modèle.
-  - Les agents tournent de manière **asynchrone et non-bloquante** : le prompt principal reste disponible pendant qu'ils travaillent.
-  - **Mémoire partagée entre agents** : tous les agents consultent et écrivent dans un journal commun (`~/.horde-cli-memoire/agents_shared.json`) pour éviter les conflits et les doublons.
-  - Chaque agent a sa propre conversation persistante et son propre historique.
-  - Sorties minimalistes : les agents affichent une ligne concise + la commande exécutée.
-- **Nouvelles commandes pour les agents** :
-  - `/agent new <modèle> <auto|safe> "<tâche>"` : Lance un agent avec le modèle spécifié. Le mode `auto` exécute sans confirmation, `safe` demande validation avant chaque action risquée.
-  - `/agents` : Affiche un tableau de bord de tous les agents actifs (statut, tâche, modèle, dernière action).
-  - `/agent stop <id>` : Arrête un agent en cours d'exécution.
-  - `/agent resume <id>` : Relance un agent en pause ou arrêté.
-  - `/agent clear-shared` : Efface la mémoire partagée entre agents.
-- **Contexte enrichi pour les agents** : Le prompt système inclut automatiquement la mémoire partagée des autres agents, permettant une coordination efficace.
-- **Architecture modulaire** : Les fonctions `createAgent`, `runAgentLoop`, `stopAgent`, `resumeAgent` ajoutées à `agent.js` sans casser le code existant.
+- **Correction critique de `launch.sh`** : suppression des chemins codés en dur. Le script détecte automatiquement son propre répertoire et le sous-dossier `src/`.
+- **Système multi-agents autonome** : plusieurs agents en tâche de fond, chacun avec sa propre conversation et son propre modèle.
+  - Exécution asynchrone non-bloquante : le prompt principal reste disponible.
+  - Mémoire partagée entre agents (`~/.horde-cli-memoire/agents_shared.json`).
+  - Sorties minimalistes : une phrase + la commande exécutée.
+- **Nouvelles commandes** : `/agent new`, `/agents`, `/agent stop`, `/agent resume`.
 
 ## 1.7.0 — Recherche sans clé, fiabilité, mode assistant, renommage
 - Projet renommé **HordeCLI** (bandeau, `package.json`).

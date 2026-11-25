@@ -10,10 +10,10 @@ import { DEFAULT_CLOUD_LIMITS } from './models.js';
 import { banner, help } from './ui.js';
 import { expand, run } from './exec.js';
 import { getHordeKey, getSearchKey, setHordeKey, setSearchKey, keySource, maskKey, setFavorites, getProviders, getProvider, setProvider, removeProvider, getLastModel, setLastModel } from './settings.js';
-import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, initConversations, resumeCommand, newConversationCommand, delConvCommand, pickStrongest, interrupt, refreshSystem, maybeWarnCloud, createAgent, getAllAgents, stopAgent, resumeAgent, clearSharedMemoryCommand } from './agent.js';
+import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, initConversations, resumeCommand, newConversationCommand, delConvCommand, pickStrongest, interrupt, refreshSystem, maybeWarnCloud, createAgent, getAllAgents, stopAgent, resumeAgent, clearSharedMemoryCommand, createSupervisor, sendMessageToAgent } from './agent.js';
 import { listModels } from './api.js';
 import { PRESETS, PRESET_ALIASES, parseRef, makeRef, iconFor } from './models.js';
-import { memoryPath, globalMemoryPath, clearSharedMemory } from './convos.js';
+import { memoryPath, globalMemoryPath } from './convos.js';
 
 let buffer = null;
 let busy = false;
@@ -26,11 +26,13 @@ const prompt = () => {
   rl.prompt();
 };
 
+// Nom lisible d'une référence de modèle
 const label = (ref) => {
   const { provider, model } = parseRef(ref);
   return provider === 'horde' ? model : `${model}  (${provider})`;
 };
 
+// "gemini gemini-2.5-flash" → référence ; null si le premier mot n'est pas un fournisseur
 function refFromArgs(tokens) {
   const [first, ...rest] = tokens;
   if (rest.length && (first === 'horde' || getProvider(first))) return makeRef(first, rest.join(' '));
@@ -47,6 +49,7 @@ async function useModel(m) {
   if (S.last) await askAI(S.last);
 }
 
+// ---------- Fichiers (découpés en parties pour respecter le budget de tokens) ----------
 function fileChunkSize() {
   if (parseRef(S.model).provider === 'horde') return MAX_FILE_CHARS;
   const p = getProvider(parseRef(S.model).provider);
@@ -96,6 +99,7 @@ async function sendFile(arg) {
   );
 }
 
+// ---------- Sauvegarde de la conversation ----------
 function save() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url));
@@ -105,6 +109,7 @@ function save() {
   } catch (e) { console.log(chalk.red('✘ Sauvegarde impossible : ' + e.message)); }
 }
 
+// ---------- Modèles favoris ----------
 function showFavs() {
   console.log(chalk.hex('#c084fc').bold('\n Modèles favoris'));
   S.favs.forEach((m, i) => {
@@ -142,6 +147,7 @@ function favCommand(arg) {
   showFavs();
 }
 
+// ---------- Clés API ----------
 function keyCommand(which, arg) {
   const horde = which === 'horde';
   const label = horde ? 'AI Horde' : 'recherche web';
@@ -168,6 +174,7 @@ function keyCommand(which, arg) {
   }
 }
 
+// ---------- Fournisseurs IA ----------
 const normKey = (k) => (['none', '-', 'aucune'].includes((k || '').toLowerCase()) ? '' : k);
 
 function showProviders() {
@@ -262,6 +269,7 @@ async function apiCommand(arg) {
   console.log(chalk.red('Usage : /api, /api add, /api del <id>, /api test <id>'));
 }
 
+// /live [fournisseur] [mots] : liste / recherche de modèles
 async function liveCommand(arg) {
   const tokens = arg.trim().split(/\s+/).filter(Boolean);
   let provider = 'horde';
@@ -269,6 +277,25 @@ async function liveCommand(arg) {
   await showModels({ provider, filter: tokens.join(' ') });
 }
 
+// ---------- Tableau de bord des agents ----------
+function showAgentsDashboard() {
+  const list = getAllAgents();
+  if (list.length === 0) {
+    console.log(chalk.gray('\nAucun agent actif. Utilise /agent new ou /supervise pour en créer un.'));
+    return;
+  }
+  console.log(chalk.bold.cyan('\n📊 Tableau de bord des agents :'));
+  list.forEach(a => {
+    const statusColor = a.status === 'running' ? chalk.green : (a.status === 'paused' ? chalk.yellow : (a.status === 'finished' ? chalk.blue : chalk.red));
+    const supervisorMark = a.isSupervisor ? chalk.hex('#fbbf24')(' 👑 SUPERVISEUR') : '';
+    console.log(`  #${a.id}${supervisorMark} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}`);
+    console.log(`     Tâche : ${a.task}`);
+    console.log(`     Dernier acte : ${a.lastAction}`);
+  });
+  console.log(chalk.gray('\n  /agent stop <id> · /agent resume <id> · /agent msg <id> "<msg>" · /agent clear-shared'));
+}
+
+// ---------- Commandes ----------
 async function command(input) {
   if (input === '/help') help(S.favs);
   else if (input === '/clear') {
@@ -339,27 +366,39 @@ async function command(input) {
   }
   else if (input === '/save') save();
   else if (input.startsWith('/file ')) await sendFile(input.slice(6));
-  // NOUVEAU : Commandes /agents
-  else if (input === '/agents' || input.startsWith('/agents ')) {
-    const list = getAllAgents();
-    if (list.length === 0) {
-      console.log(chalk.gray('\nAucun agent actif. Utilise /agent new pour en créer un.'));
-    } else {
-      console.log(chalk.bold.cyan('\n📊 Tableau de bord des agents :'));
+
+  // ========== COMMANDES AGENTS ==========
+  else if (input === '/agents') {
+    showAgentsDashboard();
+  }
+  else if (input === '/agents watch') {
+    console.log(chalk.cyan('\n👀 Mode surveillance activé (Ctrl+C pour quitter)\n'));
+    const interval = setInterval(() => {
+      const list = getAllAgents();
+      if (list.length === 0) {
+        clearInterval(interval);
+        console.log(chalk.gray('\nTous les agents sont terminés.'));
+        return;
+      }
+      console.clear();
+      console.log(chalk.bold.cyan(`📊 Tableau de bord des agents - ${new Date().toLocaleTimeString('fr-FR')}`));
+      console.log(chalk.gray('─'.repeat(60)));
       list.forEach(a => {
-        const statusColor = a.status === 'running' ? chalk.green : (a.status === 'paused' ? chalk.yellow : chalk.red);
-        console.log(`  #${a.id} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}`);
+        const statusColor = a.status === 'running' ? chalk.green : (a.status === 'paused' ? chalk.yellow : (a.status === 'finished' ? chalk.blue : chalk.red));
+        const supervisorMark = a.isSupervisor ? chalk.hex('#fbbf24')(' 👑 SUPERVISEUR') : '';
+        console.log(`  #${a.id}${supervisorMark} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}`);
         console.log(`     Tâche : ${a.task}`);
         console.log(`     Dernier acte : ${a.lastAction}`);
+        console.log('');
       });
-      console.log(chalk.gray('\n  /agent stop <id> · /agent resume <id> · /agent clear-shared'));
-    }
+      console.log(chalk.gray('Ctrl+C pour quitter la surveillance'));
+    }, 2000);
+    // Le Ctrl+C standard du programme interrompt déjà, pas besoin de gestion spéciale ici
   }
-  // NOUVEAU : Commandes /agent
   else if (input.startsWith('/agent ')) {
     const parts = input.slice(7).trim().split(/\s+/);
     const subCmd = parts[0]?.toLowerCase();
-    
+
     if (subCmd === 'new') {
       if (parts.length < 4) {
         console.log(chalk.yellow('\nUsage: /agent new <modèle> <auto|safe> "<tâche>"'));
@@ -382,16 +421,40 @@ async function command(input) {
       const id = parseInt(parts[1]);
       if (resumeAgent(id)) console.log(chalk.green(`\n▶️ Agent ${id} relancé.`));
       else console.log(chalk.red(`\n❌ Impossible de relancer l'agent ${id}.`));
+    } else if (subCmd === 'msg') {
+      if (parts.length < 3) {
+        console.log(chalk.yellow('\nUsage: /agent msg <id> "<message>"'));
+      } else {
+        const id = parseInt(parts[1]);
+        const message = parts.slice(2).join(' ').replace(/^"|"$/g, '');
+        sendMessageToAgent(id, message);
+      }
     } else if (subCmd === 'clear-shared') {
       clearSharedMemoryCommand();
     } else {
       console.log(chalk.yellow('\nCommande /agent inconnue. Tape /help.'));
     }
   }
+
+  // ========== COMMANDE SUPERVISEUR ==========
+  else if (input.startsWith('/supervise ')) {
+    const parts = input.slice(11).trim().split(/\s+/);
+    if (parts.length < 2) {
+      console.log(chalk.yellow('\nUsage: /supervise <modèle> "<tâche>"'));
+      console.log(chalk.gray('Ex: /supervise @openai:gpt-4 "Refactorise tout le code du projet"'));
+      console.log(chalk.gray('Le superviseur est une IA qui crée et coordonne d\'autres agents.'));
+    } else {
+      const model = parts[0];
+      const task = parts.slice(1).join(' ').replace(/^"|"$/g, '');
+      createSupervisor(task, model);
+    }
+  }
+
   else if (/^\/[a-z0-9]+(\s|$)/i.test(input)) console.log(chalk.red('Commande inconnue. /help pour la liste.'));
   else await askAI(input);
 }
 
+// Exécute une action en marquant le programme comme occupé (les lignes tapées pendant ce temps sont ignorées)
 async function guarded(fn) {
   busy = true;
   try { await fn(); }
@@ -406,6 +469,7 @@ else console.log(chalk.gray(`Conversation #${S.convId}. /resume : liste des conv
 prompt();
 rl.on('close', () => process.exit(0));
 
+// Ctrl+C : interrompt l'IA si elle travaille ; sinon il faut le faire 2 fois de suite pour quitter
 rl.on('SIGINT', () => {
   const now = Date.now();
   if (buffer !== null) {

@@ -62,3 +62,23 @@ export function clearSharedMemory() {
         fs.writeFileSync(SHARED_MEMORY_FILE, '', { mode: 0o600 });
     }
 }
+
+export function getConversation(convId) {
+    const p = memoryPath(convId);
+    try {
+        return JSON.parse(fs.readFileSync(p, 'utf-8'));
+    } catch {
+        return null;
+    }
+}
+
+export function saveConversation(convId, data) {
+    const p = memoryPath(convId);
+    fs.writeFileSync(p, JSON.stringify(data, null, 2), { mode: 0o600 });
+}
+
+export function addMessage(convId, role, content) {
+    const data = getConversation(convId) || { messages: [] };
+    data.messages.push({ role, content, timestamp: new Date().toISOString() });
+    saveConversation(convId, data);
+}

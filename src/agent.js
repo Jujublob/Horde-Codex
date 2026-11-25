@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import readline from 'readline';
 import chalk from 'chalk';
-import { exec } from 'child_process'; // NOUVEAU
+import { exec } from 'child_process';
 import { searchWeb } from './search_tool.js';
 import { FAVORITES, MAX_STEPS, NON_HORDE_MAX_STEPS } from './config.js';
 import { getFavorites, getSearchKey, getProviders, getLastModel, setLastModel, SETTINGS_FILE } from './settings.js';
@@ -21,16 +21,11 @@ export const S = {
   messages: [{ role: 'system', content: buildSystem(parseRef(favs[0]).provider) }]
 };
 const tried = new Set();
-// Commandes de lecture déjà exécutées dans la suite d'étapes en cours (évite les boucles de
-// re-vérification des mêmes fichiers) ; remise à zéro à chaque nouveau message de l'utilisateur.
 const seenCmds = new Map();
-// Chemins des fichiers de mémoire reconnus automatiquement (validés sans confirmation, JSON obligatoire) :
-// la mémoire de la conversation courante + la mémoire globale. Les "mémoires de projet" libres
-// ne sont plus demandées par le prompt : tout passe par ces deux fichiers, hors du dossier du programme.
 const memoryTargets = () => [memoryPath(S.convId), globalMemoryPath()].filter(Boolean);
 const isMemoryFile = (full) => memoryTargets().includes(full);
 
-const BASE_CMDS = ['/help', '/live', '/use ', '/top', '/fav ', '/file ', '/paste', '/cd ', '/auto', '/assistant', '/stop', '/api ', '/apihorde ', '/apisearch ', '/save', '/clear', '/resume', '/new', '/delconv ', '/exit'];
+const BASE_CMDS = ['/help', '/live', '/use ', '/top', '/fav ', '/file ', '/paste', '/cd ', '/auto', '/assistant', '/stop', '/api ', '/apihorde ', '/apisearch ', '/save', '/clear', '/resume', '/new', '/delconv ', '/exit', '/supervise ', '/agents'];
 const completer = (l) => {
   const all = [...BASE_CMDS, ...S.favs.map((_, i) => `/${i + 1}`)];
   const h = all.filter(c => c.startsWith(l));
@@ -38,9 +33,7 @@ const completer = (l) => {
 };
 export const rl = readline.createInterface({ input: process.stdin, output: process.stdout, completer });
 
-// Question o/N : peut être annulée par /stop ou Ctrl+C
 let askAbort = null;
-// raw = true : réponse telle quelle (clés API, URL) ; sinon minuscules (réponses o/N)
 export const ask = (q, raw = false) => new Promise((resolve) => {
   const ac = new AbortController();
   askAbort = () => ac.abort();
@@ -49,7 +42,6 @@ export const ask = (q, raw = false) => new Promise((resolve) => {
 });
 export const askRaw = (q) => ask(q, true);
 
-// Interrompt l'IA : requête en cours, commande en cours, question en attente
 export function interrupt() {
   S.stopped = true;
   console.log(chalk.yellow('\n⛔ Interruption…'));
@@ -58,14 +50,11 @@ export function interrupt() {
   askAbort?.();
 }
 
-// Reconstruit le prompt système (changement de modèle, de clé de recherche, de mode assistant...)
 export function refreshSystem() {
   S.messages[0] = { role: 'system', content: buildSystem(parseRef(S.model).provider, S.simple) };
   saveSession();
 }
 
-// Avertit une seule fois par session au premier passage sur un fournisseur autre qu'AI Horde
-// (ceux-là sont en général payants à l'usage, contrairement à Horde)
 let warnedCloudOnce = false;
 export function maybeWarnCloud(ref) {
   const provider = parseRef(ref).provider;
@@ -77,7 +66,6 @@ export function maybeWarnCloud(ref) {
 
 const LIST_MAX = 20;
 
-// Liste les modèles d'un fournisseur (AI Horde par défaut), filtrés par mots-clés
 export async function showModels({ provider = 'horde', filter = '', unavailable = false } = {}) {
   try {
     let list = await listModels(provider);
@@ -108,7 +96,6 @@ function refuse() {
   S.refused = true;
 }
 
-// Recherche web : jamais d'exception, toujours une réponse exploitable par le modèle
 async function safeSearch(query) {
   try {
     const r = await searchWeb(query);
@@ -119,7 +106,6 @@ async function safeSearch(query) {
   }
 }
 
-// Blocs ```search requête``` : le modèle lance une recherche de sa propre initiative, sans confirmation
 async function doSearches(reply) {
   const re = /```search\n([\s\S]*?)```/g;
   let m, n = 0;
@@ -147,7 +133,7 @@ async function doFile(b) {
   }
   const full = expand(b.path);
   const isMem = isMemoryFile(full);
-  const secret = full === SETTINGS_FILE; // contient les clés API : validation toujours obligatoire
+  const secret = full === SETTINGS_FILE;
   console.log(chalk.blue(`\n📝 Écrire : ${b.path} (${b.code.split('\n').length} lignes)`));
   if (secret) console.log(chalk.yellow.bold('🔒 Ce fichier contient tes clés API : validation obligatoire.'));
   if (isMem) {
@@ -158,8 +144,6 @@ async function doFile(b) {
       return;
     }
   }
-  // Un fichier existant nettement plus gros que le nouveau contenu : probablement une erreur
-  // (un append: aurait dû être utilisé) — on demande confirmation même en mode auto.
   let shrink = false;
   try {
     if (!isMem && !secret && fs.existsSync(full)) {
@@ -187,7 +171,6 @@ async function doFile(b) {
   }
 }
 
-// Blocs ```append:chemin``` : ajoute la suite d'un fichier écrit en plusieurs réponses
 async function doAppends(reply) {
   const re = /```append:([^\n]+)\n([\s\S]*?)```/g;
   if (S.simple) {
@@ -238,23 +221,18 @@ async function doCmd(b) {
     S.pending.push("[Action ignorée : le mode assistant est actif, aucun accès au système (seule la recherche web est permise). /assistant pour repasser en mode agent complet.]");
     return;
   }
-  // Sécurité : ddgr sans --json peut rester en attente d'une touche (mode interactif) — on l'ajoute au besoin.
   if (isDdgr && !/--json|--np\b|--noprompt/.test(b.code)) {
     b.code = b.code.replace(/^(\s*ddgr\b)/, '$1 --json');
   }
   const danger = isDangerous(b.code);
   const safe = isReadOnly(b.code);
-  // Le fichier des clés API ne part jamais vers le serveur sans ta validation
   const secret = /\.horde_settings/.test(b.code);
-  // L'IA peut exiger ta validation en mettant "# CONFIRM" en première ligne du bloc bash
   const force = secret || /^\s*#\s*CONFIRM\b/i.test(b.code);
   if (/(node\s+|\.\/)index\.js/.test(b.code)) {
     console.log(chalk.red('⛔ Refusé : relancerait ce CLI.'));
     S.pending.push('[Refusé : node index.js relance ce CLI interactif. Utilise node --check index.js.]');
     return;
   }
-  // Évite les boucles : une même commande de lecture déjà lancée dans cette suite d'étapes
-  // n'est pas relancée, son résultat précédent est juste rappelé à l'IA.
   const norm = b.code.trim().replace(/\s+/g, ' ');
   if (safe && seenCmds.has(norm)) {
     console.log(chalk.gray(`↻ Déjà exécuté dans cette suite d'étapes (résultat réutilisé) : ${b.code}`));
@@ -287,9 +265,7 @@ async function handleBlocks(reply) {
 }
 
 export async function askAI(input, depth = 0, retry = false) {
-  // Nouveau message de l'utilisateur : on repart avec une liste de modèles essayés vide
   if (depth === 0 && !retry) { tried.clear(); S.stopped = false; seenCmds.clear(); }
-  // Première phrase de la conversation : elle devient son titre (affiché dans /resume)
   if (S.convId != null && !loadMeta(S.convId)?.title) touchMeta(S.convId, { title: autoTitle(input) });
   const prev = S.pending;
   S.pending = [];
@@ -367,20 +343,14 @@ async function failover(e, depth) {
   return true;
 }
 
-// ---------- Bascule entre fournisseurs (IA gratuite locale, style FreeLLMAPI — sans le serveur) ----------
-// Quand AI Horde n'a plus aucun modèle disponible (panne, quota, saturé), on propose à l'utilisateur
-// de continuer avec un AUTRE fournisseur qu'il a configuré (/api add). Seuls les fournisseurs réellement
-// enregistrés apparaissent dans le choix — si Gemini n'est pas ajouté, il n'est pas proposé.
 const PROVIDER_HINTS = {
   horde: 'AI Horde', gemini: 'Gemini', openai: 'ChatGPT', claude: 'Claude',
   openrouter: 'OpenRouter', groq: 'Groq', mistral: 'Mistral', deepseek: 'DeepSeek', together: 'Together'
 };
-// Erreurs qui signifient "ce fournisseur ne répondra pas" : quota dépassé, interdiction, panne, timeout
 const isProviderDown = (e) => [402, 403, 429, 500, 502, 503, 504].includes(e?.status) || /timeout|ECONN|network|fetch failed/i.test(e?.message || '');
 
 async function providerFailover(e, depth) {
   const current = parseRef(S.model).provider;
-  // On ne bascule que depuis AI Horde : pour les autres fournisseurs, c'est l'utilisateur qui gère ses clés.
   if (current !== 'horde') return false;
   const others = Object.entries(getProviders()).filter(([id, p]) => p && p.baseUrl);
   if (!others.length) {
@@ -402,7 +372,7 @@ async function providerFailover(e, depth) {
     console.log(chalk.gray(`Fournisseur ${id} sélectionné mais aucun modèle mémorisé.`));
     console.log(chalk.gray(`Affiche la liste avec /live ${id}, choisis avec /use ${id} <modèle>, puis renvoie ton dernier message.`));
     S.last = S.last || null;
-    return true; // erreur déjà expliquée : on ne l'affiche pas une seconde fois
+    return true;
   }
   console.log(chalk.green(`↪ Bascule vers ${PROVIDER_HINTS[id] || id} (${shortName(ref)}) — la conversation est conservée.`));
   await useModelFromAgent(ref);
@@ -410,18 +380,12 @@ async function providerFailover(e, depth) {
   return true;
 }
 
-// Change de modèle depuis ce module (même chemin que /use dans index.js)
 async function useModelFromAgent(ref) {
   S.model = ref;
   setLastModel(parseRef(ref).provider, ref);
   maybeWarnCloud(ref);
   refreshSystem();
 }
-
-// ---------- Conversations (dossier ~/.horde-cli-memoire/, hors du programme) ----------
-// Chaque conversation a son numéro système (1, 2, 3... jamais réutilisé), sa session et SA mémoire ;
-// la mémoire globale est partagée entre toutes. Supprimer une conversation supprime son dossier entier,
-// donc aussi son fichier mémoire.
 
 export function saveSession() {
   if (S.convId == null) return;
@@ -431,7 +395,6 @@ export function saveSession() {
   } catch {}
 }
 
-// Recharge la session d'une conversation dans S.messages (le prompt système est reconstruit avant)
 export function loadSession(id = S.convId) {
   if (id == null) return 0;
   try {
@@ -441,7 +404,6 @@ export function loadSession(id = S.convId) {
   return 0;
 }
 
-// Change de conversation : sauvegarde l'actuelle, bascule, recharge la nouvelle.
 export function switchConversation(id) {
   saveSession();
   S.convId = id;
@@ -461,7 +423,6 @@ export function newConversation() {
   return S.convId;
 }
 
-// Au lancement : conversation la plus récente (créée/migrée si besoin), puis reprise de sa session.
 export function initConversations() {
   S.convId = defaultConversationId();
   setActiveConversation(S.convId);
@@ -469,7 +430,6 @@ export function initConversations() {
   return loadSession();
 }
 
-// /resume [n°] : liste les conversations ou bascule sur l'une d'elles
 export async function resumeCommand(arg) {
   const list = listConversations();
   if (!list.length) return console.log(chalk.gray('Aucune conversation enregistrée.'));
@@ -486,20 +446,28 @@ export async function resumeCommand(arg) {
   }
   if (!list.some(c => c.id === n)) return console.log(chalk.red(`Pas de conversation n°${n}. /resume pour la liste.`));
   const count = switchConversation(n);
+  
+  // ========== NOUVEAU : Restaurer les agents de cette conversation ==========
+  const restoredAgents = restoreAgentsFromConv(n);
+  if (restoredAgents.length > 0) {
+    console.log(chalk.green(`↺ ${restoredAgents.length} agent(s) restauré(s) depuis cette conversation.`));
+    restoredAgents.forEach(a => {
+      console.log(chalk.gray(`   Agent #${a.id} : ${a.task} (${a.status})`));
+    });
+  }
+  
   console.log(count
     ? chalk.green(`↺ Conversation #${n} reprise (${count} messages).`)
     : chalk.green(`↺ Conversation #${n} ouverte (vide).`));
-  return true; // index.js rafraîchira le bandeau
+  return true;
 }
 
-// /new : nouvelle conversation (l'actuelle reste enregistrée, récupérable avec /resume)
 export function newConversationCommand() {
   const id = newConversation();
   console.log(chalk.green(`✔ Nouvelle conversation #${id}. L'ancienne reste accessible via /resume.`));
   return id;
 }
 
-// /delconv <n°> : supprime une conversation ET son fichier mémoire (tout est dans son dossier)
 export async function delConvCommand(arg) {
   const n = parseInt(String(arg || '').trim(), 10);
   const list = listConversations();
@@ -523,30 +491,39 @@ export async function pickStrongest() {
   } catch { return "koboldcpp/Llama-3.3-70B-Instruct"; }
 }
 
-// ========== NOUVEAU : SYSTÈME MULTI-AGENTS ==========
+// ========== NOUVEAU : SYSTÈME MULTI-AGENTS AVEC SUPERVISEUR IA ==========
 
 export const agents = new Map();
+let supervisorId = null; // ID de l'agent superviseur (null si aucun)
 
 // Crée et lance un nouvel agent en tâche de fond (non-bloquant)
-export function createAgent(task, modelRef, mode) {
+export function createAgent(task, modelRef, mode, isSupervisor = false) {
   const id = agents.size > 0 ? Math.max(...agents.keys()) + 1 : 1;
-  const convId = createConversation();
+  const convId = S.convId; // L'agent utilise la conversation courante
   
   const agent = {
     id,
     task,
     modelRef,
-    mode, // 'auto' ou 'safe'
-    status: 'running', // 'running', 'paused', 'stopped', 'finished'
+    mode,
+    status: 'running',
     convId,
     lastAction: 'Initialisation...',
-    messages: [{ role: 'system', content: `Tu es un agent autonome. Tâche: ${task}. Mode: ${mode}.` }]
+    messages: [{ role: 'system', content: `Tu es un agent autonome. Tâche: ${task}. Mode: ${mode}.` }],
+    isSupervisor,
+    subAgents: isSupervisor ? [] : undefined // Liste des sous-agents pour le superviseur
   };
   
   agents.set(id, agent);
-  console.log(`\n✅ [Agent ${id}] Démarré avec le modèle ${modelRef}. Tâche: "${task}"`);
+  console.log(`\n✅ [Agent ${id}${isSupervisor ? ' (SUPERVISEUR)' : ''}] Démarré avec le modèle ${modelRef}. Tâche: "${task}"`);
   
-  // Lancer la boucle en arrière-plan (non-bloquant pour le main thread)
+  if (isSupervisor) {
+    supervisorId = id;
+  }
+  
+  // Sauvegarder l'agent dans la conversation
+  saveAgentsToConv();
+  
   runAgentLoop(agent);
   return agent;
 }
@@ -556,30 +533,28 @@ async function runAgentLoop(agent) {
   while (agent.status === 'running') {
     try {
       const { provider } = parseRef(agent.modelRef);
-      const systemPrompt = buildSystem(provider, false, true); // isAgent = true
+      const systemPrompt = buildSystem(provider, false, true);
       
-      // Appel à l'API
       const responseText = await chat(agent.modelRef, agent.messages, null);
       
       agent.messages.push({ role: 'assistant', content: responseText });
       addMessageToConv(agent.convId, 'assistant', responseText);
       
-      // Parser l'action
       const action = parseAgentAction(responseText);
       
       if (action.command) {
         if (agent.mode === 'safe') {
           agent.lastAction = `En attente de validation : ${action.explanation}`;
-          console.log(`\n⏸️ [Agent ${agent.id}] En attente de validation : ${action.explanation}`);
+          console.log(`\n⏸️ [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] En attente de validation : ${action.explanation}`);
           console.log(`   Commande : ${action.command}`);
           agent.status = 'paused';
+          saveAgentsToConv();
           break;
         } else {
           agent.lastAction = action.explanation;
-          console.log(`\n⚡ [Agent ${agent.id}] ${action.explanation}`);
+          console.log(`\n⚡ [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] ${action.explanation}`);
           console.log(`   $ ${action.command}`);
           
-          // Exécution de la commande
           exec(action.command, { cwd: process.cwd() }, (err, stdout, stderr) => {
             const result = err ? `ÉCHEC: ${stderr || err.message}` : `SUCCÈS: ${stdout.trim() || 'OK'}`;
             appendToSharedMemory(agent.id, `${action.explanation} -> ${result}`);
@@ -588,31 +563,31 @@ async function runAgentLoop(agent) {
         }
       } else {
         agent.lastAction = action.explanation || 'Réflexion en cours...';
-        console.log(`\n💬 [Agent ${agent.id}] ${agent.lastAction}`);
+        console.log(`\n💬 [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] ${agent.lastAction}`);
         appendToSharedMemory(agent.id, agent.lastAction);
       }
 
       if (action.isFinished) {
         agent.status = 'finished';
         agent.lastAction = 'Tâche terminée.';
-        console.log(`\n🏁 [Agent ${agent.id}] Tâche terminée avec succès.`);
+        console.log(`\n🏁 [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Tâche terminée avec succès.`);
         appendToSharedMemory(agent.id, 'Tâche principale terminée.');
+        saveAgentsToConv();
         break;
       }
 
-      // Petite pause pour éviter de spammer l'API
       await new Promise(r => setTimeout(r, 2000));
 
     } catch (err) {
       agent.lastAction = `Erreur: ${err.message}`;
-      console.log(`\n❌ [Agent ${agent.id}] Erreur critique : ${err.message}`);
+      console.log(`\n❌ [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Erreur critique : ${err.message}`);
       agent.status = 'paused';
+      saveAgentsToConv();
       break;
     }
   }
 }
 
-// Parse la réponse de l'IA pour extraire commande et explication
 function parseAgentAction(text) {
   const bashMatch = text.match(/```(?:bash|sh)?\n([\s\S]*?)\n```/i);
   const commandMatch = text.match(/COMMAND:\s*(.+)/i);
@@ -641,16 +616,18 @@ function parseAgentAction(text) {
   return { command, explanation, isFinished };
 }
 
-// Récupération et gestion des agents
 export function getAgent(id) { return agents.get(id); }
 export function getAllAgents() { return Array.from(agents.values()); }
+export function getSupervisor() { return supervisorId ? agents.get(supervisorId) : null; }
 
 export function stopAgent(id) {
   const agent = agents.get(id);
   if (agent && agent.status === 'running') {
     agent.status = 'stopped';
     agent.lastAction = 'Arrêté manuellement.';
-    console.log(`\n🛑 [Agent ${id}] Arrêté.`);
+    console.log(`\n🛑 [Agent ${id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Arrêté.`);
+    if (agent.isSupervisor) supervisorId = null;
+    saveAgentsToConv();
     return true;
   }
   return false;
@@ -660,15 +637,122 @@ export function resumeAgent(id) {
   const agent = agents.get(id);
   if (agent && (agent.status === 'paused' || agent.status === 'stopped')) {
     agent.status = 'running';
-    console.log(`\n▶️ [Agent ${id}] Relancé.`);
+    console.log(`\n▶️ [Agent ${id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Relancé.`);
     runAgentLoop(agent);
+    saveAgentsToConv();
     return true;
   }
   return false;
 }
 
-// Commande pour effacer la mémoire partagée
 export function clearSharedMemoryCommand() {
   clearSharedMemory();
   console.log(chalk.green('✅ Mémoire partagée des agents effacée.'));
+}
+
+// ========== NOUVEAU : PERSISTANCE DES AGENTS DANS LA CONVERSATION ==========
+
+const AGENTS_META_KEY = '__agents__';
+
+// Sauvegarde tous les agents actifs dans la conversation courante
+export function saveAgentsToConv() {
+  if (S.convId == null) return;
+  
+  const agentsData = Array.from(agents.values()).map(a => ({
+    id: a.id,
+    task: a.task,
+    modelRef: a.modelRef,
+    mode: a.mode,
+    status: a.status,
+    lastAction: a.lastAction,
+    isSupervisor: a.isSupervisor,
+    messages: a.messages.slice(-10) // Garder les 10 derniers messages
+  }));
+  
+  const convData = loadConversation(S.convId) || [];
+  convData[AGENTS_META_KEY] = agentsData;
+  saveConversation(S.convId, convData);
+}
+
+// Restaure les agents depuis une conversation
+export function restoreAgentsFromConv(convId) {
+  const convData = loadConversation(convId);
+  if (!convData || !convData[AGENTS_META_KEY]) return [];
+  
+  const savedAgents = convData[AGENTS_META_KEY];
+  const restored = [];
+  
+  savedAgents.forEach(saved => {
+    if (saved.status === 'running') {
+      // Recréer l'agent en mode paused pour éviter de spammer l'API
+      const agent = {
+        id: saved.id,
+        task: saved.task,
+        modelRef: saved.modelRef,
+        mode: saved.mode,
+        status: 'paused', // Commencer en pause pour ne pas relancer automatiquement
+        convId: convId,
+        lastAction: 'Restauré depuis session précédente',
+        messages: saved.messages || [{ role: 'system', content: `Tu es un agent autonome. Tâche: ${saved.task}.` }],
+        isSupervisor: saved.isSupervisor
+      };
+      
+      agents.set(agent.id, agent);
+      restored.push(agent);
+      
+      if (agent.isSupervisor) {
+        supervisorId = agent.id;
+      }
+      
+      console.log(chalk.gray(`   Agent #${agent.id} restauré (en pause). Utilise /agent resume ${agent.id} pour le relancer.`));
+    }
+  });
+  
+  return restored;
+}
+
+// ========== NOUVEAU : SUPERVISEUR IA ==========
+
+// Lance un superviseur IA qui peut créer et gérer d'autres agents
+export function createSupervisor(task, modelRef) {
+  const supervisorTask = `Tu es un SUPERVISEUR. Ta mission : ${task}
+
+TU PEUX :
+1. Créer des sous-agents avec la commande : /agent new <modèle> <auto|safe> "<tâche>"
+2. Voir l'état de tous les agents avec : /agents
+3. Arrêter un agent avec : /agent stop <id>
+4. Relancer un agent avec : /agent resume <id>
+5. Envoyer un message à un agent avec : /agent msg <id> "<message>"
+
+TU DOIS :
+- Analyser les besoins et déléguer aux agents appropriés
+- Vérifier leur travail régulièrement avec /agents
+- Les arrêter s'ils hallucinent ou dévient de la tâche
+- Te baser sur la mémoire globale de l'utilisateur pour respecter ses préférences
+- Coordonner les agents pour qu'ils ne fassent pas de travail en double
+
+Quand la tâche principale est terminée, dis "TERMINÉ".`;
+
+  return createAgent(supervisorTask, modelRef, 'auto', true);
+}
+
+// Envoie un message à un agent spécifique
+export function sendMessageToAgent(agentId, message) {
+  const agent = agents.get(agentId);
+  if (!agent) {
+    console.log(chalk.red(`\n❌ Agent #${agentId} introuvable.`));
+    return false;
+  }
+  
+  if (agent.status !== 'running') {
+    console.log(chalk.yellow(`\n⚠ Agent #${agentId} n'est pas en cours d'exécution (statut: ${agent.status}).`));
+    return false;
+  }
+  
+  // Ajouter le message comme une nouvelle instruction
+  agent.messages.push({ role: 'user', content: `[MESSAGE DU SUPERVISEUR/UTILISATEUR]: ${message}` });
+  addMessageToConv(agent.convId, 'user', `[MESSAGE POUR AGENT #${agentId}]: ${message}`);
+  
+  console.log(chalk.green(`\n✉️ Message envoyé à l'agent #${agentId}.`));
+  return true;
 }

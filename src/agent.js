@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import readline from 'readline';
 import chalk from 'chalk';
+import { exec } from 'child_process'; // NOUVEAU
 import { searchWeb } from './search_tool.js';
 import { FAVORITES, MAX_STEPS, NON_HORDE_MAX_STEPS } from './config.js';
 import { getFavorites, getSearchKey, getProviders, getLastModel, setLastModel, SETTINGS_FILE } from './settings.js';
@@ -10,7 +11,7 @@ import { chat, liveModels, listModels, getFinishReason } from './api.js';
 import { parseRef, makeRef, shortName, iconFor } from './models.js';
 import { spinner, printReply } from './ui.js';
 import { buildSystem, setActiveConversation, activeConversationId } from './context.js';
-import { sessionPath, memoryPath, globalMemoryPath, defaultConversationId, createConversation, listConversations, loadMeta, touchMeta, autoTitle, deleteConversation } from './convos.js';
+import { sessionPath, memoryPath, globalMemoryPath, defaultConversationId, createConversation, listConversations, loadMeta, touchMeta, autoTitle, deleteConversation, appendToSharedMemory, sharedMemoryPath, clearSharedMemory, loadConversation, saveConversation, addMessageToConv } from './convos.js';
 import { extractBlocks, expand, writeFile, run, killRunning, isDangerous, isReadOnly, checkSyntax } from './exec.js';
 
 const favs = getFavorites(FAVORITES);
@@ -520,4 +521,154 @@ export async function pickStrongest() {
     const list = await liveModels();
     return list.filter(m => sizeOf(m) >= 30).sort((a, b) => sizeOf(b) - sizeOf(a))[0] || "koboldcpp/Llama-3.3-70B-Instruct";
   } catch { return "koboldcpp/Llama-3.3-70B-Instruct"; }
+}
+
+// ========== NOUVEAU : SYSTÈME MULTI-AGENTS ==========
+
+export const agents = new Map();
+
+// Crée et lance un nouvel agent en tâche de fond (non-bloquant)
+export function createAgent(task, modelRef, mode) {
+  const id = agents.size > 0 ? Math.max(...agents.keys()) + 1 : 1;
+  const convId = createConversation();
+  
+  const agent = {
+    id,
+    task,
+    modelRef,
+    mode, // 'auto' ou 'safe'
+    status: 'running', // 'running', 'paused', 'stopped', 'finished'
+    convId,
+    lastAction: 'Initialisation...',
+    messages: [{ role: 'system', content: `Tu es un agent autonome. Tâche: ${task}. Mode: ${mode}.` }]
+  };
+  
+  agents.set(id, agent);
+  console.log(`\n✅ [Agent ${id}] Démarré avec le modèle ${modelRef}. Tâche: "${task}"`);
+  
+  // Lancer la boucle en arrière-plan (non-bloquant pour le main thread)
+  runAgentLoop(agent);
+  return agent;
+}
+
+// Boucle asynchrone d'un agent
+async function runAgentLoop(agent) {
+  while (agent.status === 'running') {
+    try {
+      const { provider } = parseRef(agent.modelRef);
+      const systemPrompt = buildSystem(provider, false, true); // isAgent = true
+      
+      // Appel à l'API
+      const responseText = await chat(agent.modelRef, agent.messages, null);
+      
+      agent.messages.push({ role: 'assistant', content: responseText });
+      addMessageToConv(agent.convId, 'assistant', responseText);
+      
+      // Parser l'action
+      const action = parseAgentAction(responseText);
+      
+      if (action.command) {
+        if (agent.mode === 'safe') {
+          agent.lastAction = `En attente de validation : ${action.explanation}`;
+          console.log(`\n⏸️ [Agent ${agent.id}] En attente de validation : ${action.explanation}`);
+          console.log(`   Commande : ${action.command}`);
+          agent.status = 'paused';
+          break;
+        } else {
+          agent.lastAction = action.explanation;
+          console.log(`\n⚡ [Agent ${agent.id}] ${action.explanation}`);
+          console.log(`   $ ${action.command}`);
+          
+          // Exécution de la commande
+          exec(action.command, { cwd: process.cwd() }, (err, stdout, stderr) => {
+            const result = err ? `ÉCHEC: ${stderr || err.message}` : `SUCCÈS: ${stdout.trim() || 'OK'}`;
+            appendToSharedMemory(agent.id, `${action.explanation} -> ${result}`);
+            addMessageToConv(agent.convId, 'system', `Commande exécutée: ${action.command}\nRésultat: ${result}`);
+          });
+        }
+      } else {
+        agent.lastAction = action.explanation || 'Réflexion en cours...';
+        console.log(`\n💬 [Agent ${agent.id}] ${agent.lastAction}`);
+        appendToSharedMemory(agent.id, agent.lastAction);
+      }
+
+      if (action.isFinished) {
+        agent.status = 'finished';
+        agent.lastAction = 'Tâche terminée.';
+        console.log(`\n🏁 [Agent ${agent.id}] Tâche terminée avec succès.`);
+        appendToSharedMemory(agent.id, 'Tâche principale terminée.');
+        break;
+      }
+
+      // Petite pause pour éviter de spammer l'API
+      await new Promise(r => setTimeout(r, 2000));
+
+    } catch (err) {
+      agent.lastAction = `Erreur: ${err.message}`;
+      console.log(`\n❌ [Agent ${agent.id}] Erreur critique : ${err.message}`);
+      agent.status = 'paused';
+      break;
+    }
+  }
+}
+
+// Parse la réponse de l'IA pour extraire commande et explication
+function parseAgentAction(text) {
+  const bashMatch = text.match(/```(?:bash|sh)?\n([\s\S]*?)\n```/i);
+  const commandMatch = text.match(/COMMAND:\s*(.+)/i);
+  const actionMatch = text.match(/ACTION:\s*(.+)/i);
+  
+  let command = null;
+  let explanation = 'Action en cours...';
+  let isFinished = false;
+
+  if (bashMatch) {
+    command = bashMatch[1].trim();
+  } else if (commandMatch) {
+    command = commandMatch[1].trim();
+  }
+
+  if (actionMatch) {
+    explanation = actionMatch[1].trim();
+  } else {
+    explanation = text.split('\n')[0].replace(/^[#\-\*]\s*/, '').trim();
+  }
+
+  if (text.toLowerCase().includes('tâche terminée') || text.toLowerCase().includes('task finished')) {
+    isFinished = true;
+  }
+
+  return { command, explanation, isFinished };
+}
+
+// Récupération et gestion des agents
+export function getAgent(id) { return agents.get(id); }
+export function getAllAgents() { return Array.from(agents.values()); }
+
+export function stopAgent(id) {
+  const agent = agents.get(id);
+  if (agent && agent.status === 'running') {
+    agent.status = 'stopped';
+    agent.lastAction = 'Arrêté manuellement.';
+    console.log(`\n🛑 [Agent ${id}] Arrêté.`);
+    return true;
+  }
+  return false;
+}
+
+export function resumeAgent(id) {
+  const agent = agents.get(id);
+  if (agent && (agent.status === 'paused' || agent.status === 'stopped')) {
+    agent.status = 'running';
+    console.log(`\n▶️ [Agent ${id}] Relancé.`);
+    runAgentLoop(agent);
+    return true;
+  }
+  return false;
+}
+
+// Commande pour effacer la mémoire partagée
+export function clearSharedMemoryCommand() {
+  clearSharedMemory();
+  console.log(chalk.green('✅ Mémoire partagée des agents effacée.'));
 }

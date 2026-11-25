@@ -13,16 +13,14 @@ export function activeConversationId() { return currentConvId; }
 
 // provider : 'horde' (par défaut) ou l'id d'un autre fournisseur (gemini, openai, claude...)
 // simple : true = mode "assistant" (juste parler + chercher, aucun accès au système, voir /assistant)
-// isAgent : true = mode agent autonome en tâche de fond (accède à la mémoire partagée)
+// isAgent : true = mode agent autonome en tâche de fond (accède à la mémoire partagée des agents)
 export function buildSystem(provider = 'horde', simple = false, isAgent = false) {
   if (simple) return SIMPLE_PROMPT;
 
   const globMem = readMemoryRaw(globalMemoryPath());
   const convMem = currentConvId != null ? readMemoryRaw(memoryPath(currentConvId)) : '';
-  
-  // NOUVEAU : mémoire partagée pour les agents
+  // Mémoire partagée : injectée uniquement pour les agents en tâche de fond
   const sharedMem = isAgent ? readMemoryRaw(sharedMemoryPath(), 5000) : '';
-  
   let ls = '';
   try { ls = fs.readdirSync(process.cwd()).slice(0, 40).join(', '); } catch {}
   const isHorde = provider === 'horde';
@@ -33,12 +31,10 @@ export function buildSystem(provider = 'horde', simple = false, isAgent = false)
   const convLine = currentConvId != null
     ? `Conversation n°${currentConvId} — mémoire de cette conversation (${memoryPath(currentConvId)}) : ${convMem || '(vide)'}`
     : '';
-  
-  // NOUVEAU : ligne pour les agents avec mémoire partagée
+  // Ligne mémoire partagée pour les agents
   const agentLine = isAgent && sharedMem
     ? `MÉMOIRE PARTAGÉE DES AUTRES AGENTS (à consulter pour éviter les conflits et les doublons) :\n${sharedMem}`
     : '';
-  
   return [
     base + search, '',
     `Dossier courant : ${process.cwd()}`,
@@ -48,7 +44,7 @@ export function buildSystem(provider = 'horde', simple = false, isAgent = false)
     `Date : ${new Date().toLocaleString('fr-FR')}`,
     `Mémoire globale (${globalMemoryPath()}) : ${globMem || '(vide)'}`,
     convLine,
-    agentLine // NOUVEAU
+    agentLine
   ].filter(Boolean).join('\n');
 }
 

@@ -2,6 +2,22 @@
 
 Numérotation indicative (pas de tags Git officiels tant que tu ne les poses pas toi-même).
 
+## 1.8.0 — Système multi-agents et correction critique
+- **Correction critique de `launch.sh`** : Suppression des chemins codés en dur (`~/horde-codex-portable`). Le script détecte désormais automatiquement son propre répertoire d'exécution et le sous-dossier `src/` si présent. Les utilisateurs peuvent renommer ou déplacer le dossier du programme sans casser le lancement.
+- **Système multi-agents autonome** : Nouveau module permettant de lancer plusieurs agents en tâche de fond, chacun avec sa propre conversation et son propre modèle.
+  - Les agents tournent de manière **asynchrone et non-bloquante** : le prompt principal reste disponible pendant qu'ils travaillent.
+  - **Mémoire partagée entre agents** : tous les agents consultent et écrivent dans un journal commun (`~/.horde-cli-memoire/agents_shared.json`) pour éviter les conflits et les doublons.
+  - Chaque agent a sa propre conversation persistante et son propre historique.
+  - Sorties minimalistes : les agents affichent une ligne concise + la commande exécutée.
+- **Nouvelles commandes pour les agents** :
+  - `/agent new <modèle> <auto|safe> "<tâche>"` : Lance un agent avec le modèle spécifié. Le mode `auto` exécute sans confirmation, `safe` demande validation avant chaque action risquée.
+  - `/agents` : Affiche un tableau de bord de tous les agents actifs (statut, tâche, modèle, dernière action).
+  - `/agent stop <id>` : Arrête un agent en cours d'exécution.
+  - `/agent resume <id>` : Relance un agent en pause ou arrêté.
+  - `/agent clear-shared` : Efface la mémoire partagée entre agents.
+- **Contexte enrichi pour les agents** : Le prompt système inclut automatiquement la mémoire partagée des autres agents, permettant une coordination efficace.
+- **Architecture modulaire** : Les fonctions `createAgent`, `runAgentLoop`, `stopAgent`, `resumeAgent` ajoutées à `agent.js` sans casser le code existant.
+
 ## 1.7.0 — Recherche sans clé, fiabilité, mode assistant, renommage
 - Projet renommé **HordeCLI** (bandeau, `package.json`).
 - Recherche web sans clé API : l'IA lance `ddgr --json ta requête` dans un bloc bash (corrigé automatiquement si le modèle oublie `--json`, ajouté à la liste des commandes sans confirmation). L'ancien mécanisme par clé (Tavily, `/apisearch`) reste disponible mais n'est plus mis en avant dans le prompt.

@@ -10,10 +10,10 @@ import { DEFAULT_CLOUD_LIMITS } from './models.js';
 import { banner, help } from './ui.js';
 import { expand, run } from './exec.js';
 import { getHordeKey, getSearchKey, setHordeKey, setSearchKey, keySource, maskKey, setFavorites, getProviders, getProvider, setProvider, removeProvider, getLastModel, setLastModel } from './settings.js';
-import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, initConversations, resumeCommand, newConversationCommand, delConvCommand, pickStrongest, interrupt, refreshSystem, maybeWarnCloud } from './agent.js';
+import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, initConversations, resumeCommand, newConversationCommand, delConvCommand, pickStrongest, interrupt, refreshSystem, maybeWarnCloud, createAgent, getAllAgents, stopAgent, resumeAgent, clearSharedMemoryCommand } from './agent.js';
 import { listModels } from './api.js';
 import { PRESETS, PRESET_ALIASES, parseRef, makeRef, iconFor } from './models.js';
-import { memoryPath, globalMemoryPath } from './convos.js';
+import { memoryPath, globalMemoryPath, clearSharedMemory } from './convos.js';
 
 let buffer = null;
 let busy = false;
@@ -26,13 +26,11 @@ const prompt = () => {
   rl.prompt();
 };
 
-// Nom lisible d'une référence de modèle
 const label = (ref) => {
   const { provider, model } = parseRef(ref);
   return provider === 'horde' ? model : `${model}  (${provider})`;
 };
 
-// "gemini gemini-2.5-flash" → référence ; null si le premier mot n'est pas un fournisseur
 function refFromArgs(tokens) {
   const [first, ...rest] = tokens;
   if (rest.length && (first === 'horde' || getProvider(first))) return makeRef(first, rest.join(' '));
@@ -49,14 +47,11 @@ async function useModel(m) {
   if (S.last) await askAI(S.last);
 }
 
-// ---------- Fichiers (découpés en parties pour respecter le budget de tokens) ----------
-// Taille d'une partie envoyée par /file : généreuse pour les fournisseurs cloud (gros contexte),
-// plus stricte pour AI Horde (petit contexte, voir config.js).
 function fileChunkSize() {
   if (parseRef(S.model).provider === 'horde') return MAX_FILE_CHARS;
   const p = getProvider(parseRef(S.model).provider);
   const limits = p?.limits || DEFAULT_CLOUD_LIMITS;
-  return Math.floor(limits.prompt * 2.5); // large marge, laissée à fitToTokenBudget pour l'ajustement fin
+  return Math.floor(limits.prompt * 2.5);
 }
 
 function splitParts(text, size) {
@@ -101,7 +96,6 @@ async function sendFile(arg) {
   );
 }
 
-// ---------- Sauvegarde de la conversation ----------
 function save() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url));
@@ -111,7 +105,6 @@ function save() {
   } catch (e) { console.log(chalk.red('✘ Sauvegarde impossible : ' + e.message)); }
 }
 
-// ---------- Modèles favoris ----------
 function showFavs() {
   console.log(chalk.hex('#c084fc').bold('\n Modèles favoris'));
   S.favs.forEach((m, i) => {
@@ -149,7 +142,6 @@ function favCommand(arg) {
   showFavs();
 }
 
-// ---------- Clés API (enregistrées dans ~/.horde_settings.json, hors du dossier du programme) ----------
 function keyCommand(which, arg) {
   const horde = which === 'horde';
   const label = horde ? 'AI Horde' : 'recherche web';
@@ -162,7 +154,7 @@ function keyCommand(which, arg) {
     else console.log(`Clé ${label} : ${maskKey(k)} (via ${src})`);
     return;
   }
-  if (/\s/.test(v)) return console.log(chalk.red('La clé ne doit pas contenir d’espace.'));
+  if (/\s/.test(v)) return console.log(chalk.red('La clé ne doit pas contenir d'espace.'));
   if (v.toLowerCase() === 'off') {
     if (horde) setHordeKey(null); else setSearchKey(null);
     console.log(chalk.green(`✔ Clé ${label} retirée.`));
@@ -176,7 +168,6 @@ function keyCommand(which, arg) {
   }
 }
 
-// ---------- Fournisseurs IA (Gemini, ChatGPT, Claude, personnalisés...) ----------
 const normKey = (k) => (['none', '-', 'aucune'].includes((k || '').toLowerCase()) ? '' : k);
 
 function showProviders() {
@@ -207,7 +198,6 @@ async function saveProvider(id, data) {
   await testProvider(id);
 }
 
-// Menu guidé : choisir un fournisseur dans la liste, puis coller la clé
 async function providerWizard() {
   const ids = Object.keys(PRESETS);
   console.log(chalk.hex('#c084fc').bold('\n Ajouter un fournisseur IA\n'));
@@ -229,7 +219,7 @@ async function providerWizard() {
   }
   const key = await askRaw(chalk.cyan(` Clé API ${data.name} (« none » si aucune) : `));
   if (!key) return console.log(chalk.gray('Annulé.'));
-  if (/\s/.test(key)) return console.log(chalk.red('La clé ne doit pas contenir d’espace.'));
+  if (/\s/.test(key)) return console.log(chalk.red('La clé ne doit pas contenir d'espace.'));
   await saveProvider(id, { ...data, key: normKey(key) });
 }
 
@@ -272,7 +262,6 @@ async function apiCommand(arg) {
   console.log(chalk.red('Usage : /api, /api add, /api del <id>, /api test <id>'));
 }
 
-// /live [fournisseur] [mots] : liste / recherche de modèles
 async function liveCommand(arg) {
   const tokens = arg.trim().split(/\s+/).filter(Boolean);
   let provider = 'horde';
@@ -280,7 +269,6 @@ async function liveCommand(arg) {
   await showModels({ provider, filter: tokens.join(' ') });
 }
 
-// ---------- Commandes ----------
 async function command(input) {
   if (input === '/help') help(S.favs);
   else if (input === '/clear') {
@@ -288,8 +276,6 @@ async function command(input) {
     S.pending = []; saveSession();
     S.last = null;
     show();
-    // La mémoire vit dans le dossier de la conversation courante (~/.horde-cli-memoire/conversations/<n°>/),
-    // plus jamais dans ~/.ia_memory.json : on propose de vider celle de cette conversation.
     const hasContent = (p) => { try { const t = fs.readFileSync(p, 'utf-8').trim(); return !!t && t !== '{}' && t !== '[]'; } catch { return false; } };
     const memTargets = [memoryPath(S.convId), globalMemoryPath()].filter(Boolean);
     const existing = memTargets.filter(hasContent);
@@ -353,11 +339,59 @@ async function command(input) {
   }
   else if (input === '/save') save();
   else if (input.startsWith('/file ')) await sendFile(input.slice(6));
+  // NOUVEAU : Commandes /agents
+  else if (input === '/agents' || input.startsWith('/agents ')) {
+    const list = getAllAgents();
+    if (list.length === 0) {
+      console.log(chalk.gray('\nAucun agent actif. Utilise /agent new pour en créer un.'));
+    } else {
+      console.log(chalk.bold.cyan('\n📊 Tableau de bord des agents :'));
+      list.forEach(a => {
+        const statusColor = a.status === 'running' ? chalk.green : (a.status === 'paused' ? chalk.yellow : chalk.red);
+        console.log(`  #${a.id} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}`);
+        console.log(`     Tâche : ${a.task}`);
+        console.log(`     Dernier acte : ${a.lastAction}`);
+      });
+      console.log(chalk.gray('\n  /agent stop <id> · /agent resume <id> · /agent clear-shared'));
+    }
+  }
+  // NOUVEAU : Commandes /agent
+  else if (input.startsWith('/agent ')) {
+    const parts = input.slice(7).trim().split(/\s+/);
+    const subCmd = parts[0]?.toLowerCase();
+    
+    if (subCmd === 'new') {
+      if (parts.length < 4) {
+        console.log(chalk.yellow('\nUsage: /agent new <modèle> <auto|safe> "<tâche>"'));
+        console.log(chalk.gray('Ex: /agent new @openai:gpt-4 auto "Analyse tous les fichiers .js du dossier"'));
+      } else {
+        const model = parts[1];
+        const mode = parts[2].toLowerCase();
+        if (mode !== 'auto' && mode !== 'safe') {
+          console.log(chalk.red('\nLe mode doit être "auto" ou "safe".'));
+        } else {
+          const task = parts.slice(3).join(' ').replace(/^"|"$/g, '');
+          createAgent(task, model, mode);
+        }
+      }
+    } else if (subCmd === 'stop') {
+      const id = parseInt(parts[1]);
+      if (stopAgent(id)) console.log(chalk.green(`\n🛑 Agent ${id} arrêté.`));
+      else console.log(chalk.red(`\n❌ Agent ${id} introuvable ou déjà arrêté.`));
+    } else if (subCmd === 'resume') {
+      const id = parseInt(parts[1]);
+      if (resumeAgent(id)) console.log(chalk.green(`\n▶️ Agent ${id} relancé.`));
+      else console.log(chalk.red(`\n❌ Impossible de relancer l'agent ${id}.`));
+    } else if (subCmd === 'clear-shared') {
+      clearSharedMemoryCommand();
+    } else {
+      console.log(chalk.yellow('\nCommande /agent inconnue. Tape /help.'));
+    }
+  }
   else if (/^\/[a-z0-9]+(\s|$)/i.test(input)) console.log(chalk.red('Commande inconnue. /help pour la liste.'));
   else await askAI(input);
 }
 
-// Exécute une action en marquant le programme comme occupé (les lignes tapées pendant ce temps sont ignorées)
 async function guarded(fn) {
   busy = true;
   try { await fn(); }
@@ -372,7 +406,6 @@ else console.log(chalk.gray(`Conversation #${S.convId}. /resume : liste des conv
 prompt();
 rl.on('close', () => process.exit(0));
 
-// Ctrl+C : interrompt l'IA si elle travaille ; sinon il faut le faire 2 fois de suite pour quitter
 rl.on('SIGINT', () => {
   const now = Date.now();
   if (buffer !== null) {

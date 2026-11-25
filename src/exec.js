@@ -71,8 +71,9 @@ export function run(cmd) {
     const add = (d) => { process.stdout.write(d); out += d; };
     p.stdout.on('data', add);
     p.stderr.on('data', add);
-    const timer = setTimeout(() => killTree(p), 120000);
-    const done = (r) => { clearTimeout(timer); if (current === p) current = null; resolve(r); };
+    // PAS de timeout : la commande tourne autant que nécessaire.
+    // L'interruption reste possible via /stop ou Ctrl+C (killRunning).
+    const done = (r) => { if (current === p) current = null; resolve(r); };
     p.on('close', (code, sig) => done({ code: code ?? (sig ? `interrompu (${sig})` : -1), out: out.slice(-2500) }));
     p.on('error', (e) => done({ code: -1, out: e.message }));
   });

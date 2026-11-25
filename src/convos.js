@@ -7,13 +7,13 @@ import path from 'path';
 const DATA_DIR = path.join(os.homedir(), '.horde-cli-memoire');
 const CONVOS_DIR = path.join(DATA_DIR, 'conversations');
 const GLOBAL_FILE = path.join(DATA_DIR, 'global.json');
-const SHARED_MEMORY_FILE = path.join(DATA_DIR, 'agents_shared.json'); // NOUVEAU : mémoire partagée entre agents
+const SHARED_MEMORY_FILE = path.join(DATA_DIR, 'agents_shared.json');
 // Anciens emplacements (avant la séparation par conversation), pour migration unique au premier lancement.
 const LEGACY_MEMORY = path.join(os.homedir(), '.ia_memory.json');
 const LEGACY_SESSION = path.join(os.homedir(), '.horde_session.json');
 
 export const globalMemoryPath = () => GLOBAL_FILE;
-export const sharedMemoryPath = () => SHARED_MEMORY_FILE; // NOUVEAU
+export const sharedMemoryPath = () => SHARED_MEMORY_FILE;
 
 function ensureDirs() {
   fs.mkdirSync(CONVOS_DIR, { recursive: true });
@@ -23,6 +23,7 @@ function convDir(id) { return path.join(CONVOS_DIR, String(id)); }
 export function sessionPath(id) { return path.join(convDir(id), 'session.json'); }
 export function memoryPath(id) { return path.join(convDir(id), 'memory.json'); }
 function metaPath(id) { return path.join(convDir(id), 'meta.json'); }
+export function agentsPath(id) { return path.join(convDir(id), 'agents.json'); }
 
 function readJSON(p, fallback) {
   try { return JSON.parse(fs.readFileSync(p, 'utf-8')); } catch { return fallback; }
@@ -121,9 +122,8 @@ export function deleteConversation(id) {
   try { fs.rmSync(dir, { recursive: true, force: true }); return true; } catch { return false; }
 }
 
-// ========== NOUVELLES FONCTIONS POUR AGENTS ==========
+// ========== MÉMOIRE PARTAGÉE ENTRE AGENTS ==========
 
-// Lecture de la mémoire partagée entre agents
 export function readSharedMemory() {
   try {
     return fs.readFileSync(SHARED_MEMORY_FILE, 'utf-8');
@@ -132,39 +132,38 @@ export function readSharedMemory() {
   }
 }
 
-// Ajout d'une entrée dans la mémoire partagée
 export function appendToSharedMemory(agentId, action) {
   const timestamp = new Date().toLocaleString('fr-FR');
   const entry = `[${timestamp}] Agent ${agentId}: ${action}\n`;
   fs.appendFileSync(SHARED_MEMORY_FILE, entry, { mode: 0o600 });
 }
 
-// Effacement de la mémoire partagée
 export function clearSharedMemory() {
   if (fs.existsSync(SHARED_MEMORY_FILE)) {
     fs.writeFileSync(SHARED_MEMORY_FILE, '', { mode: 0o600 });
   }
 }
 
-// Sauvegarde d'une session de conversation
-export function saveConversation(convId, messages) {
-  const p = sessionPath(convId);
-  fs.writeFileSync(p, JSON.stringify(messages, null, 2), { mode: 0o600 });
+// ========== PERSISTANCE DES AGENTS DANS LA CONVERSATION ==========
+// Les agents sont sauvegardés dans un fichier séparé (agents.json) dans le dossier
+// de la conversation, pour ne pas interferer avec session.json (les messages).
+
+export function saveAgentsData(convId, agentsData) {
+  ensureDirs();
+  fs.mkdirSync(convDir(convId), { recursive: true });
+  writeJSON(agentsPath(convId), agentsData);
 }
 
-// Chargement d'une session de conversation
-export function loadConversation(convId) {
-  const p = sessionPath(convId);
-  try {
-    return JSON.parse(fs.readFileSync(p, 'utf-8'));
-  } catch {
-    return null;
-  }
+export function loadAgentsData(convId) {
+  return readJSON(agentsPath(convId), []);
 }
 
-// Ajout d'un message à une conversation
+// Ajout d'un message à une conversation (utilisé par les agents pour leur historique)
 export function addMessageToConv(convId, role, content) {
-  const data = loadConversation(convId) || [];
-  data.push({ role, content, timestamp: new Date().toISOString() });
-  saveConversation(convId, data);
+  try {
+    const p = sessionPath(convId);
+    const data = readJSON(p, []);
+    data.push({ role, content, timestamp: new Date().toISOString() });
+    writeJSON(p, data);
+  } catch {}
 }

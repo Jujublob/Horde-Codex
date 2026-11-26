@@ -62,10 +62,11 @@ export const SIMPLE_PROMPT = [
 
 // ---------- Agents en arrière-plan : capacité annoncée à l'IA (conversation principale ET agents) ----------
 // Convention EXÉCUTÉE par le programme (agent.js) : bloc ```agent pour déléguer, lignes /agent... pour piloter.
-// L'IA découvre ainsi qu'elle peut lancer elle-même des agents, chacun avec son propre modèle.
 export const AGENTS_PROMPT = [
   "AGENTS : tu peux déléguer des sous-tâches à des agents autonomes en arrière-plan (chacun son modèle ; ils travaillent pendant que tu continues).",
-  "Lancer un agent : bloc ```agent:<modèle> <auto|safe> puis la tâche COMPLÈTE sur les lignes suivantes, fermé par ```. Modèle omis = modèle actuel. auto = agit seul ; safe = toute action sensible est mise en attente de validation de l'utilisateur.",
-  "Piloter (chaque commande sur sa propre ligne, hors bloc) : /agents · /agent stop <n°> · /agent resume <n°> · /agent msg <n°> \"message\". Les états et résultats te reviennent au message suivant.",
-  "Délègue ce qui est long ou parallélisable (un agent par sous-tâche, modèle adapté au domaine) ; fais toi-même le simple. Ne refais pas le travail déjà fait par un autre agent."
+  "Lancer un agent : bloc ```agent:<modèle> <auto|safe> puis la tâche COMPLÈTE sur les lignes suivantes, fermé par ```.",
+  "MODÈLE : un nom SANS @ est un modèle AI Horde (ex : koboldcpp/Qwen2.5-Coder-32B-Instruct). Pour Gemini/ChatGPT/Claude/autres, utilise @fournisseur:modèle (ex : @openai:gpt-4o, @gemini:gemini-2.5-flash, @claude:claude-3-5-sonnet-latest). Dans le doute, OMETS le modèle : le modèle actuel sera utilisé. N'invente jamais un nom de modèle Horde.",
+  "auto = l'agent agit seul ; safe = toute action sensible est mise en attente de validation de l'utilisateur.",
+  "Piloter (chaque commande sur sa propre ligne, JAMAIS dans un bloc bash) : /agents · /agent show <n°> · /agent stop <n°> · /agent resume <n°> · /agent msg <n°> \"message\". Les états et résultats te reviennent au message suivant.",
+  "HONNÊTETÉ : n'affirme JAMAIS qu'un agent a réussi ou qu'un fichier existe sans l'avoir vérifié (/agents, /agent show, ou un bloc bash ls/cat). Un agent lancé n'est PAS un agent terminé. Délègue ce qui est long ou parallélisable ; fais toi-même le simple."
 ].join("\n");

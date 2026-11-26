@@ -37,17 +37,23 @@ export function buildSystem(provider = 'horde', simple = false, isAgent = false)
   const agentLine = isAgent
     ? `MÉMOIRE PARTAGÉE DES AUTRES AGENTS (à consulter pour éviter les conflits et les doublons) :\n${sharedMem || '(vide)'}`
     : '';
-  return [
-    base + search, '',
+
+  // Pour les agents, la mémoire partagée est placée TÔT (juste après le prompt de base) afin de
+  // survivre à la troncature du budget de tokens sur AI Horde (petits contextes).
+  const parts = [base + search];
+  if (isAgent && agentLine) parts.push(agentLine);
+  parts.push(
+    '',
     `Dossier courant : ${process.cwd()}`,
     "ACCES : tu peux lire et modifier TOUS les fichiers de l'utilisateur, pas seulement le dossier courant. Utilise des chemins absolus. Home : " + os.homedir() + ". Pour explorer, lance ls ~ ou find ~ -maxdepth 2, ne te limite jamais au dossier courant.",
     "Contenu du home : " + (() => { try { return fs.readdirSync(os.homedir()).slice(0, 40).join(', '); } catch { return ''; } })(),
     `Contenu : ${ls}`,
     `Date : ${new Date().toLocaleString('fr-FR')}`,
     `Mémoire globale (${globalMemoryPath()}) : ${globMem || '(vide)'}`,
-    convLine,
-    agentLine
-  ].filter(Boolean).join('\n');
+    convLine
+  );
+  if (!isAgent && agentLine) parts.push(agentLine);
+  return parts.filter(Boolean).join('\n');
 }
 
 // Lecture directe d'un fichier JSON tronqué (évite une dépendance vers convos.js dans ce sens-là)

@@ -232,7 +232,19 @@ function doCd(dir) {
   } catch (e) { console.log(chalk.red(e.message)); }
 }
 
+// Un bloc bash qui contient en réalité une directive /agents ou /agent ... (erreur fréquente des
+// petits modèles) est redirigé vers le contrôle d'agents au lieu d'être exécuté comme commande shell.
+function isAgentDirectiveText(code) {
+  const t = code.trim();
+  return /^\/agents?$/.test(t) || /^\/agent\s/.test(t) || /^\/supervise\s/.test(t);
+}
+
 async function doCmd(b) {
+  // Redirection des directives d'agents mises par erreur dans un bloc bash.
+  if (isAgentDirectiveText(b.code)) {
+    for (const f of processAgentControl(b.code, null)) S.pending.push(f);
+    return;
+  }
   const isDdgr = /^\s*ddgr\b/.test(b.code);
   if (S.simple && !isDdgr) {
     console.log(chalk.gray(`↷ Ignoré (mode assistant actif) : ${b.code}`));
@@ -559,18 +571,18 @@ const execCapture = (cmd, cwd) => new Promise((resolve) => {
   });
 });
 
-// Prompt système d'un agent : contexte complet (mémoire globale + partagée + capacité agents)
-// + son rôle + son régime de supervision. Reconstruit à chaque étape.
+// Prompt système d'un agent : le RÔLE, le STYLE et la supervision sont placés EN TÊTE pour
+// survivre à la troncature du budget de tokens sur AI Horde (petits contextes). Le contexte
+// (mémoire globale + partagée + capacité agents) suit, construit par buildSystem.
 function agentSystemPrompt(agent) {
   const role = agent.isSupervisor
-    ? "RÔLE : SUPERVISEUR — tu délègues aux agents, tu vérifies leur travail, tu les recadres (msg) ou les arrêtes s'ils dévient de la tâche. Respecte les préférences durables de la mémoire globale de l'utilisateur."
+    ? "RÔLE : SUPERVISEUR — tu délègues aux agents, tu vérifies leur travail, tu les recadres (msg) ou les arrêtes s'ils dévient. Respecte les préférences durables de la mémoire globale de l'utilisateur."
     : "RÔLE : AGENT DE TÂCHE — exécute uniquement ta tâche, sans bavardage, sans empiéter sur le travail des autres agents.";
   let supLine = '';
   if (agent.supervision === 'approval') supLine = "\nSUPERVISION : chacune de tes actions doit être validée par le superviseur avant exécution. Propose une action à la fois et attends sa décision.";
   else if (agent.supervision === 'auto') supLine = `\nSUPERVISION : mode auto accordé par le superviseur, il te reste ${agent.autoStepsLeft} étape(s) avant pause automatique.`;
-  return buildSystem(parseRef(agent.modelRef).provider, false, true)
-    + '\n' + role + supLine
-    + "\nSTYLE : une phrase courte décrivant l'action en cours + le bloc d'action. C'est tout. Quand la tâche est finie et vérifiée, termine ta réponse par TERMINÉ seul sur la dernière ligne.";
+  const head = role + supLine + "\nSTYLE : une phrase courte décrivant l'action en cours + le bloc d'action. C'est tout. Quand la tâche est finie et vérifiée, termine ta réponse par TERMINÉ seul sur la dernière ligne.";
+  return head + '\n' + buildSystem(parseRef(agent.modelRef).provider, false, true);
 }
 
 // Crée et lance un agent en tâche de fond (non bloquant : le prompt principal reste disponible)
@@ -735,6 +747,15 @@ function notifySupervisor(agent, text) {
   else console.log(chalk.gray(`\nℹ️ ${text}`));
 }
 
+// Rend compte du résultat RÉEL d'un agent à son parent : au superviseur s'il tourne, sinon à
+// l'IA principale (via S.pending) pour qu'elle ne croie pas à tort que la tâche a réussi.
+function reportAgentOutcome(agent) {
+  const line = `[Agent #${agent.id} ${agent.status === 'finished' ? 'TERMINÉ' : 'EN PAUSE'}] ${agent.task.slice(0, 60)} — ${agent.lastAction}`;
+  const sup = getSupervisor();
+  if (sup && sup.status === 'running' && sup.id !== agent.id) sup.messages.push({ role: 'user', content: line });
+  else if (!agent.isSupervisor && agent.parentId == null) S.pending.push(line);
+}
+
 // Soumet une action au superviseur pour validation. Retourne false s'il n'est pas disponible
 // (l'appelant retombe alors sur une validation utilisateur).
 function sendToSupervisor(agent, action, why) {
@@ -868,6 +889,8 @@ async function runAgentLoop(agent) {
       for (const b of extractBlocks(reply)) {
         if (agent.status !== 'running') break;
         if (b.type === 'file') { await agentFileBlock(agent, b, feedback); continue; }
+        // Directive d'agents mise par erreur dans un bloc bash → contrôle d'agents, pas shell.
+        if (isAgentDirectiveText(b.code)) { feedback.push(...processAgentControl(b.code, agent)); continue; }
         if (/(node\s+|\.\/)index\.js/.test(b.code)) { feedback.push('[Refusé : node index.js relance ce CLI interactif. Utilise node --check index.js.]'); continue; }
         const danger = isDangerous(b.code);
         const secret = /\.horde_settings/.test(b.code);
@@ -912,6 +935,7 @@ async function runAgentLoop(agent) {
         agent.lastAction = 'Tâche terminée.';
         console.log(chalk.green(`\n🏁 [Agent ${agent.id}] Tâche terminée.`));
         appendToSharedMemory(agent.id, `TÂCHE TERMINÉE : ${agent.task}`);
+        reportAgentOutcome(agent);
         saveAgentsToConv();
         break;
       }
@@ -924,6 +948,7 @@ async function runAgentLoop(agent) {
       agent.status = 'paused';
       agent.lastAction = `Erreur : ${err.message}`;
       console.log(chalk.red(`\n❌ [Agent ${agent.id}] ${err.message} — /agent resume ${agent.id} pour réessayer.`));
+      reportAgentOutcome(agent);
     }
     saveAgentsToConv();
   } finally {
@@ -1150,11 +1175,12 @@ export function createSupervisor(task, modelRef) {
   const t = [
     `SUPERVISION : ${task}`,
     "Découpe en sous-tâches et délègue : bloc ```agent:<modèle> <auto|safe> puis la tâche complète (un agent par sous-tâche, modèle adapté au domaine : code, rédaction, analyse...).",
-    "Contrôle de l'autonomie des agents (chaque commande sur sa propre ligne) :",
+    "MODÈLE : nom sans @ = AI Horde ; pour le cloud utilise @fournisseur:modèle (ex : @openai:gpt-4o, @gemini:gemini-2.5-flash). Dans le doute, omets le modèle (modèle actuel). N'invente pas un nom Horde.",
+    "Contrôle de l'autonomie des agents (chaque commande sur sa propre ligne, JAMAIS dans un bloc bash) :",
     "/agent auto <n°> = l'agent agit seul pendant 10 étapes puis se met en pause (tu peux lui en redonner 10).",
     "/agent valid <n°> = chaque action de l'agent doit être validée par toi : tu recevras une demande, réponds /agent allow <n°> ou /agent deny <n°>.",
     "/agent user <n°> = rendre le contrôle à l'utilisateur. /agent show <n°> = voir ses derniers échanges.",
-    "Surveille : /agents. Vérifie le travail produit avec des blocs ```bash (cat, node --check, git diff...).",
+    "Surveille : /agents. Vérifie le travail produit avec des blocs ```bash (cat, node --check, git diff...). N'affirme jamais qu'un agent a réussi sans avoir vérifié.",
     "Recadre un agent qui dérive ou hallucine : /agent msg <n°> \"consigne\". Arrête-le si nécessaire : /agent stop <n°>.",
     "Respecte les préférences durables de la mémoire globale de l'utilisateur. Évite les doublons entre agents (mémoire partagée).",
     "Quand TOUT est fini et vérifié : TERMINÉ seul sur la dernière ligne."

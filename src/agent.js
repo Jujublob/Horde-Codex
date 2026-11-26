@@ -7,7 +7,7 @@ import { exec } from 'child_process';
 import { searchWeb } from './search_tool.js';
 import { FAVORITES, MAX_STEPS, NON_HORDE_MAX_STEPS } from './config.js';
 import { getFavorites, getSearchKey, getProviders, getLastModel, setLastModel, SETTINGS_FILE } from './settings.js';
-import { chat, liveModels, listModels, getFinishReason } from './api.js';
+import { chat, liveModels, listModels } from './api.js';
 import { parseRef, makeRef, shortName, iconFor } from './models.js';
 import { spinner, printReply } from './ui.js';
 import { buildSystem, setActiveConversation, activeConversationId } from './context.js';
@@ -279,7 +279,7 @@ async function doCmd(b) {
 async function handleBlocks(reply) {
   await doSearches(reply);
   // Délégation / supervision d'agents demandée par l'IA dans sa réponse :
-  // blocs ```agent (lancer) et lignes /agents, /agent stop|resume|msg|new (piloter).
+  // blocs ```agent (lancer) et lignes /agents, /agent stop|resume|msg|new|auto|valid|allow|deny|user|show.
   for (const f of processAgentControl(reply, null)) S.pending.push(f);
   for (const b of extractBlocks(reply)) {
     if (S.stopped) break;
@@ -307,8 +307,8 @@ export async function askAI(input, depth = 0, retry = false) {
   let replied = false;
   try {
     S.ctrl = new AbortController();
-    const reply = await chat(S.model, S.messages, S.ctrl.signal);
-    const cut = getFinishReason() === 'length';
+    const { text: reply, finish } = await chat(S.model, S.messages, S.ctrl.signal);
+    const cut = finish === 'length';
     stop();
     if (S.stopped) { const e = new Error('Interrompu'); e.interrupted = true; throw e; }
     if (!reply) throw new Error('Réponse vide.');
@@ -560,13 +560,16 @@ const execCapture = (cmd, cwd) => new Promise((resolve) => {
 });
 
 // Prompt système d'un agent : contexte complet (mémoire globale + partagée + capacité agents)
-// + son rôle. Reconstruit à chaque étape pour voir les nouveautés de la mémoire partagée.
+// + son rôle + son régime de supervision. Reconstruit à chaque étape.
 function agentSystemPrompt(agent) {
   const role = agent.isSupervisor
     ? "RÔLE : SUPERVISEUR — tu délègues aux agents, tu vérifies leur travail, tu les recadres (msg) ou les arrêtes s'ils dévient de la tâche. Respecte les préférences durables de la mémoire globale de l'utilisateur."
     : "RÔLE : AGENT DE TÂCHE — exécute uniquement ta tâche, sans bavardage, sans empiéter sur le travail des autres agents.";
+  let supLine = '';
+  if (agent.supervision === 'approval') supLine = "\nSUPERVISION : chacune de tes actions doit être validée par le superviseur avant exécution. Propose une action à la fois et attends sa décision.";
+  else if (agent.supervision === 'auto') supLine = `\nSUPERVISION : mode auto accordé par le superviseur, il te reste ${agent.autoStepsLeft} étape(s) avant pause automatique.`;
   return buildSystem(parseRef(agent.modelRef).provider, false, true)
-    + '\n' + role
+    + '\n' + role + supLine
     + "\nSTYLE : une phrase courte décrivant l'action en cours + le bloc d'action. C'est tout. Quand la tâche est finie et vérifiée, termine ta réponse par TERMINÉ seul sur la dernière ligne.";
 }
 
@@ -580,6 +583,9 @@ export function createAgent(task, modelRef, mode, isSupervisor = false, parentId
     cwd: process.cwd(), // dossier figé au lancement (un /cd du premier plan ne le déplace pas)
     lastAction: 'Initialisation…',
     isSupervisor, parentId,
+    supervision: null,   // null = utilisateur | 'auto' = 10 étapes accordées | 'approval' = superviseur valide tout
+    autoStepsLeft: 0,
+    pendingFor: null,    // 'user' | 'supervisor' : qui doit valider l'action en attente
     pendingAction: null, ctrl: null, loopRunning: false,
     messages: []
   };
@@ -616,6 +622,15 @@ function agentsReport() {
   ).join('\n');
 }
 
+// Extrait lisible des derniers échanges d'un agent (pour /agent show, renvoyé au modèle)
+function agentTranscript(id) {
+  const a = agents.get(id);
+  if (!a) return `Agent #${id} introuvable.`;
+  const head = `#${a.id} [${a.status}] ${a.modelRef} — tâche: ${a.task}`;
+  const recent = a.messages.slice(-6).map(m => `${m.role}: ${String(m.content).replace(/\s+/g, ' ').slice(0, 180)}`).join('\n');
+  return head + '\n' + recent;
+}
+
 // Profondeur de délégation (agent → sous-agent → ...) : garde-fou anti-récursion, pas une limite
 // sur le nombre d'agents en parallèle (il n'y en a pas).
 function agentDepth(a) {
@@ -639,6 +654,7 @@ function processAgentControl(reply, fromAgent) {
     else if ((m = /^\/agent\s+resume\s+(\d+)\s*$/i.exec(l))) directives.push({ type: 'resume', id: +m[1] });
     else if ((m = /^\/agent\s+msg\s+(\d+)\s+(.+)$/i.exec(l))) directives.push({ type: 'msg', id: +m[1], text: m[2].replace(/^"|"$/g, '') });
     else if ((m = /^\/agent\s+new\s+(\S+)\s+(auto|safe)\s+(.+)$/i.exec(l))) directives.push({ type: 'new', model: m[1], mode: m[2].toLowerCase(), task: m[3].replace(/^"|"$/g, '') });
+    else if ((m = /^\/agent\s+(auto|valid|allow|deny|user|show)\s+(\d+)\s*$/i.exec(l))) directives.push({ type: 'sup', op: m[1].toLowerCase(), id: +m[2] });
   }
   if (!blocks.length && !directives.length) return feedback;
   if (!fromAgent && S.simple) return ['[Délégation ignorée : le mode assistant est actif, aucun accès au système. /assistant pour repasser en mode agent complet.]'];
@@ -659,12 +675,27 @@ function processAgentControl(reply, fromAgent) {
     const target = agents.get(d.id);
     if (!target) { feedback.push(`[Agent #${d.id} introuvable.]`); continue; }
     if (fromAgent && target.id === fromAgent.id) { feedback.push('[Refusé : un agent ne peut pas agir sur lui-même via commande.]'); continue; }
-    if (d.type === 'stop') feedback.push(stopAgent(d.id) ? `[Agent #${d.id} arrêté.]` : `[Agent #${d.id} déjà arrêté ou terminé.]`);
-    else if (d.type === 'resume') feedback.push(resumeAgent(d.id) ? `[Agent #${d.id} relancé.]` : `[Agent #${d.id} non relançable (statut ${target.status}).]`);
-    else if (d.type === 'msg') {
+    if (d.type === 'stop') { feedback.push(stopAgent(d.id) ? `[Agent #${d.id} arrêté.]` : `[Agent #${d.id} déjà arrêté ou terminé.]`); continue; }
+    if (d.type === 'resume') { feedback.push(resumeAgent(d.id) ? `[Agent #${d.id} relancé.]` : `[Agent #${d.id} non relançable (statut ${target.status}).]`); continue; }
+    if (d.type === 'msg') {
       const src = fromAgent ? `superviseur #${fromAgent.id}` : "utilisateur";
       target.messages.push({ role: 'user', content: `[MESSAGE du ${src}] : ${d.text}` });
       feedback.push(`[Message transmis à l'agent #${d.id}${target.status === 'running' ? '' : ' (en pause : lu à sa reprise)'}]`);
+      continue;
+    }
+    if (d.type === 'sup') {
+      // Seul le superviseur (ou l'utilisateur / l'IA principale) peut gérer l'autonomie des agents.
+      const canSup = !fromAgent || fromAgent.isSupervisor;
+      if (!canSup) { feedback.push("[Refusé : seul le superviseur (ou l'utilisateur) peut gérer la supervision.]"); continue; }
+      if (d.op === 'show') { feedback.push(`[Agent #${d.id} :\n${agentTranscript(d.id)}]`); continue; }
+      let ok = false;
+      if (d.op === 'auto') ok = grantAgentAuto(d.id);
+      else if (d.op === 'valid') ok = setAgentApproval(d.id);
+      else if (d.op === 'allow') ok = supervisorAllow(d.id);
+      else if (d.op === 'deny') ok = supervisorDeny(d.id);
+      else if (d.op === 'user') ok = setAgentUserControl(d.id);
+      feedback.push(ok ? `[Agent #${d.id} : ${d.op} appliqué.]` : `[Agent #${d.id} : ${d.op} impossible.]`);
+      continue;
     }
   }
   return feedback;
@@ -678,15 +709,122 @@ function isFinishedReply(reply) {
   return /^terminé$/i.test(last) || /^tâche terminée$/i.test(last);
 }
 
-// Met un agent en pause avec une action en attente : /agent resume <n°> = valider et continuer,
-// /agent stop <n°> = annuler. Utilisé pour le mode safe ET les garde-fous (danger, clés, # CONFIRM).
+// Met un agent en pause avec une action en attente de l'UTILISATEUR : /agent resume <n°> = valider.
 function pauseForValidation(agent, action, why) {
   agent.pendingAction = action;
+  agent.pendingFor = 'user';
   agent.status = 'paused';
   agent.lastAction = `En attente de validation : ${why}`;
   console.log(chalk.yellow(`\n⏸️ [Agent ${agent.id}] ${why}`));
   console.log(chalk.gray(`   /agent resume ${agent.id} = valider et continuer · /agent stop ${agent.id} = annuler`));
   saveAgentsToConv();
+}
+
+// ---------- Régime de supervision décidé par le superviseur ----------
+// Décide qui valide une action : exécution directe, utilisateur, ou superviseur.
+function actionGate(agent) {
+  if (agent.supervision === 'approval') return 'supervisor';
+  if (agent.supervision === 'auto') return 'execute'; // les étapes restantes sont vérifiées en tête de boucle
+  return agent.mode === 'safe' ? 'user' : 'execute';
+}
+
+// Informe le superviseur (s'il tourne) ; sinon l'utilisateur voit le message.
+function notifySupervisor(agent, text) {
+  const sup = getSupervisor();
+  if (sup && sup.status === 'running' && sup.id !== agent.id) sup.messages.push({ role: 'user', content: text });
+  else console.log(chalk.gray(`\nℹ️ ${text}`));
+}
+
+// Soumet une action au superviseur pour validation. Retourne false s'il n'est pas disponible
+// (l'appelant retombe alors sur une validation utilisateur).
+function sendToSupervisor(agent, action, why) {
+  const sup = getSupervisor();
+  if (sup && sup.status === 'running' && sup.id !== agent.id) {
+    agent.pendingAction = action;
+    agent.pendingFor = 'supervisor';
+    agent.status = 'paused';
+    agent.lastAction = `En attente du superviseur : ${why}`;
+    const desc = action.kind === 'bash' ? action.code : `${action.kind} ${action.path}`;
+    sup.messages.push({ role: 'user', content: `[DEMANDE DE VALIDATION — agent #${agent.id}] ${desc}\nRéponds sur une ligne : /agent allow ${agent.id} (autoriser) ou /agent deny ${agent.id} (refuser).` });
+    console.log(chalk.yellow(`\n📨 [Agent ${agent.id}] Action soumise au superviseur : ${why}`));
+    saveAgentsToConv();
+    return true;
+  }
+  return false;
+}
+
+// /agent auto <n°> : accorde 10 étapes autonomes puis pause (renouvelable par le superviseur).
+export function grantAgentAuto(id) {
+  const a = agents.get(id);
+  if (!a) { console.log(chalk.red(`\n❌ Agent #${id} introuvable.`)); return false; }
+  a.supervision = 'auto'; a.autoStepsLeft = 10; a.pendingFor = null;
+  console.log(chalk.green(`\n🤖 [Agent ${id}] Mode auto accordé : 10 étapes puis pause.`));
+  saveAgentsToConv();
+  if (a.status === 'paused' || a.status === 'stopped') {
+    a.status = 'running';
+    if (a.pendingAction) { const p = a.pendingAction; a.pendingAction = null; executeApproved(a, p); }
+    else runAgentLoop(a);
+  }
+  return true;
+}
+
+// /agent valid <n°> : chaque action de l'agent devra être validée par le superviseur.
+export function setAgentApproval(id) {
+  const a = agents.get(id);
+  if (!a) { console.log(chalk.red(`\n❌ Agent #${id} introuvable.`)); return false; }
+  a.supervision = 'approval'; a.autoStepsLeft = 0;
+  console.log(chalk.green(`\n🔐 [Agent ${id}] Chaque action devra être validée par le superviseur.`));
+  saveAgentsToConv();
+  if (a.status === 'paused' || a.status === 'stopped') { a.status = 'running'; runAgentLoop(a); }
+  return true;
+}
+
+// /agent allow <n°> : le superviseur autorise l'action en attente.
+export function supervisorAllow(id) {
+  const a = agents.get(id);
+  if (!a || !a.pendingAction) { console.log(chalk.yellow(`\n⚠ Agent #${id} : rien en attente.`)); return false; }
+  const p = a.pendingAction; a.pendingAction = null; a.pendingFor = null; a.status = 'running';
+  console.log(chalk.green(`\n✔ [Agent ${id}] Action autorisée.`));
+  saveAgentsToConv();
+  executeApproved(a, p);
+  return true;
+}
+
+// /agent deny <n°> : le superviseur refuse l'action en attente.
+export function supervisorDeny(id) {
+  const a = agents.get(id);
+  if (!a || !a.pendingAction) { console.log(chalk.yellow(`\n⚠ Agent #${id} : rien en attente.`)); return false; }
+  a.pendingAction = null; a.pendingFor = null; a.status = 'running';
+  a.messages.push({ role: 'user', content: '[Le superviseur a REFUSÉ cette action. Propose autre chose ou termine.]' });
+  console.log(chalk.yellow(`\n✘ [Agent ${id}] Action refusée par le superviseur.`));
+  saveAgentsToConv();
+  runAgentLoop(a);
+  return true;
+}
+
+// /agent user <n°> : rendre le contrôle à l'utilisateur.
+export function setAgentUserControl(id) {
+  const a = agents.get(id);
+  if (!a) { console.log(chalk.red(`\n❌ Agent #${id} introuvable.`)); return false; }
+  a.supervision = null; a.autoStepsLeft = 0;
+  if (a.pendingFor === 'supervisor') a.pendingFor = 'user';
+  console.log(chalk.green(`\n👤 [Agent ${id}] Contrôle rendu à l'utilisateur (/agent resume pour valider).`));
+  saveAgentsToConv();
+  return true;
+}
+
+// /agent show <n°> : voir les derniers échanges d'un agent SANS l'arrêter.
+export function showAgentCommand(id) {
+  const a = agents.get(id);
+  if (!a) { console.log(chalk.red(`\n❌ Agent #${id} introuvable.`)); return; }
+  console.log(chalk.bold.cyan(`\n🔎 Agent #${id} — ${a.status} — ${a.modelRef}`));
+  console.log(chalk.gray(`Tâche : ${a.task}`));
+  if (a.supervision) console.log(chalk.gray(`Supervision : ${a.supervision === 'auto' ? `auto (${a.autoStepsLeft} étapes restantes)` : 'validation par le superviseur'}`));
+  for (const m of a.messages.slice(-8)) {
+    const who = m.role === 'user' ? '→' : '✦';
+    console.log(chalk.gray(`  ${who} [${m.role}] ${String(m.content).replace(/\s+/g, ' ').slice(0, 200)}`));
+  }
+  if (a.pendingAction) console.log(chalk.yellow(`  ⏸ Action en attente (${a.pendingFor || 'utilisateur'}) : ${a.pendingAction.kind === 'bash' ? a.pendingAction.code.split('\n')[0] : a.pendingAction.path}`));
 }
 
 // Boucle asynchrone d'un agent : appelle son modèle, exécute ses blocs, LUI RENVOIE les résultats
@@ -696,6 +834,18 @@ async function runAgentLoop(agent) {
   agent.loopRunning = true;
   try {
     while (agent.status === 'running') {
+      // Mode auto accordé par le superviseur : 10 étapes puis pause automatique.
+      if (agent.supervision === 'auto') {
+        if (agent.autoStepsLeft <= 0) {
+          agent.status = 'paused';
+          agent.lastAction = '10 étapes auto effectuées — en attente du superviseur.';
+          notifySupervisor(agent, `[Agent #${agent.id} a effectué ses 10 étapes auto et s'est arrêté. /agent auto ${agent.id} pour 10 de plus, /agent valid ${agent.id} pour validation, /agent stop ${agent.id} pour arrêter.]`);
+          console.log(chalk.yellow(`\n⏸️ [Agent ${agent.id}] 10 étapes auto effectuées — en attente du superviseur.`));
+          saveAgentsToConv();
+          break;
+        }
+        agent.autoStepsLeft--;
+      }
       agent.messages[0] = { role: 'system', content: agentSystemPrompt(agent) };
       if (agent.messages.length > 17) {
         agent.messages = [agent.messages[0], ...agent.messages.slice(-12)];
@@ -703,7 +853,7 @@ async function runAgentLoop(agent) {
       }
       agent.ctrl = new AbortController();
       let reply;
-      try { reply = await chat(agent.modelRef, agent.messages, agent.ctrl.signal); }
+      try { reply = (await chat(agent.modelRef, agent.messages, agent.ctrl.signal)).text; }
       finally { agent.ctrl = null; }
       if (agent.status !== 'running') break; // arrêté pendant l'appel
       if (!reply) throw new Error('Réponse vide.');
@@ -714,7 +864,7 @@ async function runAgentLoop(agent) {
       feedback.push(...processAgentControl(reply, agent));
       // Phrase d'avancement : première ligne non vide hors bloc (une seule phrase affichée)
       const phrase = (reply.trim().split('\n').find(l => l.trim() && !l.trim().startsWith('```')) || 'Action…').trim().slice(0, 100);
-      // 2) Blocs file: et bash, avec les MÊMES garde-fous que le premier plan
+      // 2) Blocs file: et bash, avec garde-fous + régime de supervision
       for (const b of extractBlocks(reply)) {
         if (agent.status !== 'running') break;
         if (b.type === 'file') { await agentFileBlock(agent, b, feedback); continue; }
@@ -722,9 +872,22 @@ async function runAgentLoop(agent) {
         const danger = isDangerous(b.code);
         const secret = /\.horde_settings/.test(b.code);
         const force = /^\s*#\s*CONFIRM\b/i.test(b.code);
-        if (danger || secret || force || agent.mode === 'safe') {
-          const why = danger ? 'commande dangereuse' : secret ? 'fichier de clés API' : force ? 'validation demandée (# CONFIRM)' : 'mode safe';
-          pauseForValidation(agent, { kind: 'bash', code: b.code }, `${why} : ${b.code.split('\n')[0].slice(0, 70)}`);
+        const action = { kind: 'bash', code: b.code };
+        // Garde-fous durs : TOUJOURS l'utilisateur, jamais le superviseur.
+        if (danger || secret || force) {
+          const why = danger ? 'commande dangereuse' : secret ? 'fichier de clés API' : 'validation demandée (# CONFIRM)';
+          pauseForValidation(agent, action, `${why} : ${b.code.split('\n')[0].slice(0, 70)}`);
+          feedback.push('[Action en attente de validation utilisateur, non exécutée.]');
+          break;
+        }
+        const gate = actionGate(agent);
+        if (gate === 'supervisor') {
+          if (!sendToSupervisor(agent, action, b.code.split('\n')[0].slice(0, 70))) pauseForValidation(agent, action, 'superviseur indisponible — validation utilisateur');
+          feedback.push('[Action soumise pour validation, non exécutée.]');
+          break;
+        }
+        if (gate === 'user') {
+          pauseForValidation(agent, action, 'mode safe');
           feedback.push('[Action en attente de validation utilisateur, non exécutée.]');
           break;
         }
@@ -769,7 +932,7 @@ async function runAgentLoop(agent) {
 }
 
 // Écriture de fichier par un agent : mêmes règles que doFile (mémoire JSON valide, clés API et
-// raccourcissement suspect → validation), mais sans JAMAIS prendre la main sur le readline.
+// raccourcissement suspect → validation utilisateur), plus le régime de supervision.
 async function agentFileBlock(agent, b, feedback) {
   const full = expand(b.path);
   const isMem = [memoryPath(agent.convId), globalMemoryPath()].includes(full);
@@ -786,9 +949,20 @@ async function agentFileBlock(agent, b, feedback) {
       if (oldLen > 200 && newLen < oldLen * 0.5) shrink = true;
     }
   } catch {}
-  if (secret || shrink || (!isMem && agent.mode === 'safe')) {
-    const why = secret ? 'fichier de clés API' : shrink ? 'raccourcissement suspect' : 'mode safe';
-    pauseForValidation(agent, { kind: 'file', path: b.path, code: b.code }, `écrire ${b.path} (${why})`);
+  const action = { kind: 'file', path: b.path, code: b.code };
+  if (secret || shrink) {
+    pauseForValidation(agent, action, `écrire ${b.path} (${secret ? 'fichier de clés API' : 'raccourcissement suspect'})`);
+    feedback.push('[Écriture en attente de validation utilisateur, non effectuée.]');
+    return;
+  }
+  const gate = actionGate(agent);
+  if (gate === 'supervisor') {
+    if (!sendToSupervisor(agent, action, `écrire ${b.path}`)) pauseForValidation(agent, action, `écrire ${b.path} (superviseur indisponible)`);
+    feedback.push('[Écriture soumise pour validation, non effectuée.]');
+    return;
+  }
+  if (gate === 'user') {
+    pauseForValidation(agent, action, `écrire ${b.path} (mode safe)`);
     feedback.push('[Écriture en attente de validation utilisateur, non effectuée.]');
     return;
   }
@@ -806,7 +980,7 @@ async function agentFileBlock(agent, b, feedback) {
   }
 }
 
-// Blocs append: d'un agent (suite d'un fichier long), mêmes garde-fous.
+// Blocs append: d'un agent (suite d'un fichier long), mêmes garde-fous + supervision.
 async function agentAppends(agent, reply, feedback) {
   const re = /```append:([^\n]+)\n([\s\S]*?)```/g;
   let m;
@@ -820,8 +994,20 @@ async function agentAppends(agent, reply, feedback) {
       continue;
     }
     const secret = full === SETTINGS_FILE;
-    if (secret || agent.mode === 'safe') {
-      pauseForValidation(agent, { kind: 'append', path: p, code }, `ajouter à ${p}${secret ? ' (fichier de clés API)' : ' (mode safe)'}`);
+    const action = { kind: 'append', path: p, code };
+    if (secret) {
+      pauseForValidation(agent, action, `ajouter à ${p} (fichier de clés API)`);
+      feedback.push('[Ajout en attente de validation utilisateur, non effectué.]');
+      break;
+    }
+    const gate = actionGate(agent);
+    if (gate === 'supervisor') {
+      if (!sendToSupervisor(agent, action, `ajouter à ${p}`)) pauseForValidation(agent, action, `ajouter à ${p} (superviseur indisponible)`);
+      feedback.push('[Ajout soumis pour validation, non effectué.]');
+      break;
+    }
+    if (gate === 'user') {
+      pauseForValidation(agent, action, `ajouter à ${p} (mode safe)`);
       feedback.push('[Ajout en attente de validation utilisateur, non effectué.]');
       break;
     }
@@ -847,6 +1033,7 @@ export function stopAgent(id) {
   a.status = 'stopped';
   a.lastAction = 'Arrêté.';
   a.pendingAction = null;
+  a.pendingFor = null;
   a.ctrl?.abort();
   if (a.isSupervisor && supervisorId === id) supervisorId = null;
   console.log(chalk.yellow(`\n🛑 [Agent ${id}] Arrêté.`));
@@ -862,12 +1049,13 @@ export function resumeAgent(id) {
   a.status = 'running';
   console.log(chalk.green(`\n▶️ [Agent ${id}] Repris.`));
   saveAgentsToConv();
-  if (a.pendingAction) { const p = a.pendingAction; a.pendingAction = null; executeApproved(a, p); }
+  if (a.pendingAction) { const p = a.pendingAction; a.pendingAction = null; a.pendingFor = null; executeApproved(a, p); }
   else runAgentLoop(a);
   return true;
 }
 
-// Exécute l'action validée par l'utilisateur (via /agent resume), puis relance la boucle.
+// Exécute l'action validée (par l'utilisateur via /agent resume, ou le superviseur via /agent allow),
+// puis relance la boucle.
 async function executeApproved(agent, p) {
   const feedback = [];
   try {
@@ -914,6 +1102,7 @@ export function saveAgentsToConv() {
     byConv.get(a.convId).push({
       id: a.id, task: a.task, modelRef: a.modelRef, mode: a.mode, status: a.status,
       lastAction: a.lastAction, isSupervisor: a.isSupervisor, parentId: a.parentId, cwd: a.cwd,
+      supervision: a.supervision, autoStepsLeft: a.autoStepsLeft,
       messages: a.messages.slice(-10)
     });
   }
@@ -936,6 +1125,7 @@ export function restoreAgentsFromConv(convId) {
       status: 'paused', convId, cwd: s.cwd || process.cwd(),
       lastAction: `Restauré (en pause) — /agent resume ${id} pour reprendre.`,
       isSupervisor: !!s.isSupervisor, parentId: s.parentId ?? null,
+      supervision: s.supervision ?? null, autoStepsLeft: s.autoStepsLeft ?? 0, pendingFor: null,
       pendingAction: null, ctrl: null, loopRunning: false,
       messages: Array.isArray(s.messages) && s.messages.length ? s.messages : []
     };
@@ -960,7 +1150,11 @@ export function createSupervisor(task, modelRef) {
   const t = [
     `SUPERVISION : ${task}`,
     "Découpe en sous-tâches et délègue : bloc ```agent:<modèle> <auto|safe> puis la tâche complète (un agent par sous-tâche, modèle adapté au domaine : code, rédaction, analyse...).",
-    "Surveille : /agents sur sa propre ligne. Vérifie le travail produit avec des blocs ```bash (cat, node --check, git diff...).",
+    "Contrôle de l'autonomie des agents (chaque commande sur sa propre ligne) :",
+    "/agent auto <n°> = l'agent agit seul pendant 10 étapes puis se met en pause (tu peux lui en redonner 10).",
+    "/agent valid <n°> = chaque action de l'agent doit être validée par toi : tu recevras une demande, réponds /agent allow <n°> ou /agent deny <n°>.",
+    "/agent user <n°> = rendre le contrôle à l'utilisateur. /agent show <n°> = voir ses derniers échanges.",
+    "Surveille : /agents. Vérifie le travail produit avec des blocs ```bash (cat, node --check, git diff...).",
     "Recadre un agent qui dérive ou hallucine : /agent msg <n°> \"consigne\". Arrête-le si nécessaire : /agent stop <n°>.",
     "Respecte les préférences durables de la mémoire globale de l'utilisateur. Évite les doublons entre agents (mémoire partagée).",
     "Quand TOUT est fini et vérifié : TERMINÉ seul sur la dernière ligne."

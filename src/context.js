@@ -1,8 +1,8 @@
 import fs from 'fs';
 import os from 'os';
-import { SYSTEM_PROMPT, SYSTEM_PROMPT_CLOUD, SEARCH_PROMPT, SIMPLE_PROMPT } from './config.js';
+import { SYSTEM_PROMPT, SYSTEM_PROMPT_CLOUD, SEARCH_PROMPT, SIMPLE_PROMPT, AGENTS_PROMPT } from './config.js';
 import { getSearchKey } from './settings.js';
-import { globalMemoryPath, memoryPath, sharedMemoryPath, readSharedMemory } from './convos.js';
+import { globalMemoryPath, memoryPath, sharedMemoryPath } from './convos.js';
 
 // Conversation active (fixée au lancement / après /resume ou /new) : c'est elle qui détermine
 // quel fichier de mémoire est lu et demandé à l'IA. La mémoire globale (~/.horde-cli-memoire/global.json)
@@ -13,7 +13,7 @@ export function activeConversationId() { return currentConvId; }
 
 // provider : 'horde' (par défaut) ou l'id d'un autre fournisseur (gemini, openai, claude...)
 // simple : true = mode "assistant" (juste parler + chercher, aucun accès au système, voir /assistant)
-// isAgent : true = mode agent autonome en tâche de fond (accède à la mémoire partagée des agents)
+// isAgent : true = agent en tâche de fond (mémoire partagée des agents injectée en plus)
 export function buildSystem(provider = 'horde', simple = false, isAgent = false) {
   if (simple) return SIMPLE_PROMPT;
 
@@ -24,16 +24,18 @@ export function buildSystem(provider = 'horde', simple = false, isAgent = false)
   let ls = '';
   try { ls = fs.readdirSync(process.cwd()).slice(0, 40).join(', '); } catch {}
   const isHorde = provider === 'horde';
-  const base = isHorde ? SYSTEM_PROMPT : SYSTEM_PROMPT_CLOUD;
+  // La capacité de déléguer à des agents est annoncée à TOUTES les IA en mode agent complet
+  // (conversation principale comprise) : c'est ce qui permet à l'IA de lancer des agents elle-même.
+  const base = (isHorde ? SYSTEM_PROMPT : SYSTEM_PROMPT_CLOUD) + '\n' + AGENTS_PROMPT;
   // Ancien mécanisme de recherche par clé API (Tavily), optionnel et réservé à Horde pour ne pas
   // surcharger le prompt des autres fournisseurs qui ont souvent déjà leur propre recherche.
   const search = (isHorde && getSearchKey()) ? '\n' + SEARCH_PROMPT : '';
   const convLine = currentConvId != null
     ? `Conversation n°${currentConvId} — mémoire de cette conversation (${memoryPath(currentConvId)}) : ${convMem || '(vide)'}`
     : '';
-  // Ligne mémoire partagée pour les agents
-  const agentLine = isAgent && sharedMem
-    ? `MÉMOIRE PARTAGÉE DES AUTRES AGENTS (à consulter pour éviter les conflits et les doublons) :\n${sharedMem}`
+  // Ligne mémoire partagée pour les agents (toujours présente pour eux, même vide au démarrage)
+  const agentLine = isAgent
+    ? `MÉMOIRE PARTAGÉE DES AUTRES AGENTS (à consulter pour éviter les conflits et les doublons) :\n${sharedMem || '(vide)'}`
     : '';
   return [
     base + search, '',

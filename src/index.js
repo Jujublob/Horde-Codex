@@ -10,7 +10,7 @@ import { DEFAULT_CLOUD_LIMITS } from './models.js';
 import { banner, help } from './ui.js';
 import { expand, run } from './exec.js';
 import { getHordeKey, getSearchKey, setHordeKey, setSearchKey, keySource, maskKey, setFavorites, getProviders, getProvider, setProvider, removeProvider, getLastModel, setLastModel } from './settings.js';
-import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, initConversations, resumeCommand, newConversationCommand, delConvCommand, pickStrongest, interrupt, refreshSystem, maybeWarnCloud, createAgent, getAllAgents, stopAgent, resumeAgent, clearSharedMemoryCommand, createSupervisor, sendMessageToAgent } from './agent.js';
+import { S, rl, ask, askAI, askRaw, showModels, saveSession, loadSession, initConversations, resumeCommand, newConversationCommand, delConvCommand, pickStrongest, interrupt, refreshSystem, maybeWarnCloud, createAgent, getAllAgents, stopAgent, resumeAgent, clearSharedMemoryCommand, createSupervisor, sendMessageToAgent, showAgentCommand, grantAgentAuto, setAgentApproval, supervisorAllow, supervisorDeny, setAgentUserControl } from './agent.js';
 import { listModels } from './api.js';
 import { PRESETS, PRESET_ALIASES, parseRef, makeRef, iconFor } from './models.js';
 import { memoryPath, globalMemoryPath } from './convos.js';
@@ -20,7 +20,7 @@ let busy = false;
 let lastSigint = 0;
 let watchTimer = null; // /agents watch : rafraîchissement auto (null = inactif)
 
-const show = () => banner(S.model, S.auto, { search: !!getSearchKey(), simple: S.simple, conv: S.convId });
+const show = () => banner(S.model, S.auto, { search: !!getSearchKey(), simple: S.simple, conv: S.convId, agents: getAllAgents().filter(a => a.status === 'running' || a.status === 'paused').length });
 const prompt = () => {
   const dir = process.cwd().split('/').pop() || '/';
   rl.setPrompt(chalk.cyan.bold(`\n${dir}${S.auto ? " [AUTO]" : ""} ❯ `));
@@ -292,11 +292,12 @@ function showAgentsDashboard() {
   list.forEach(a => {
     const statusColor = a.status === 'running' ? chalk.green : (a.status === 'paused' ? chalk.yellow : (a.status === 'finished' ? chalk.blue : chalk.red));
     const supervisorMark = a.isSupervisor ? chalk.hex('#fbbf24')(' 👑 SUPERVISEUR') : '';
-    console.log(`  #${a.id}${supervisorMark} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}`);
+    const supMark = a.supervision === 'auto' ? chalk.gray(` · auto ${a.autoStepsLeft}`) : (a.supervision === 'approval' ? chalk.gray(' · validation superviseur') : '');
+    console.log(`  #${a.id}${supervisorMark} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}${supMark}`);
     console.log(`     Tâche : ${a.task}`);
     console.log(`     Dernier acte : ${a.lastAction}`);
   });
-  console.log(chalk.gray('\n  /agent stop <id> · /agent resume <id> · /agent msg <id> "<msg>" · /agent clear-shared · /agents watch'));
+  console.log(chalk.gray('\n  /agent show|stop|resume|msg <id> · /agent auto|valid|allow|deny|user <id> · /agents watch'));
 }
 
 function stopWatch(msg) {
@@ -336,6 +337,7 @@ async function agentCommands(input) {
   if (input.startsWith('/agent ')) {
     const parts = input.slice(7).trim().split(/\s+/);
     const subCmd = parts[0]?.toLowerCase();
+    const id = parseInt(parts[1]);
     if (subCmd === 'new') {
       if (parts.length < 4) {
         console.log(chalk.yellow('\nUsage: /agent new <modèle> <auto|safe> "<tâche>"'));
@@ -346,15 +348,17 @@ async function agentCommands(input) {
         if (mode !== 'auto' && mode !== 'safe') console.log(chalk.red('\nLe mode doit être "auto" ou "safe".'));
         else createAgent(parts.slice(3).join(' ').replace(/^"|"$/g, ''), model, mode);
       }
-    } else if (subCmd === 'stop') {
-      const id = parseInt(parts[1]);
-      if (!stopAgent(id)) console.log(chalk.red(`\n❌ Agent ${id} introuvable ou déjà arrêté.`));
-    } else if (subCmd === 'resume') {
-      const id = parseInt(parts[1]);
-      if (!resumeAgent(id)) console.log(chalk.red(`\n❌ Impossible de relancer l'agent ${id}.`));
-    } else if (subCmd === 'msg') {
+    } else if (subCmd === 'show') { showAgentCommand(id); }
+    else if (subCmd === 'stop') { if (!stopAgent(id)) console.log(chalk.red(`\n❌ Agent ${id} introuvable ou déjà arrêté.`)); }
+    else if (subCmd === 'resume') { if (!resumeAgent(id)) console.log(chalk.red(`\n❌ Impossible de relancer l'agent ${id}.`)); }
+    else if (subCmd === 'auto') { grantAgentAuto(id); }
+    else if (subCmd === 'valid') { setAgentApproval(id); }
+    else if (subCmd === 'allow') { supervisorAllow(id); }
+    else if (subCmd === 'deny') { supervisorDeny(id); }
+    else if (subCmd === 'user') { setAgentUserControl(id); }
+    else if (subCmd === 'msg') {
       if (parts.length < 3) console.log(chalk.yellow('\nUsage: /agent msg <id> "<message>"'));
-      else sendMessageToAgent(parseInt(parts[1]), parts.slice(2).join(' ').replace(/^"|"$/g, ''));
+      else sendMessageToAgent(id, parts.slice(2).join(' ').replace(/^"|"$/g, ''));
     } else if (subCmd === 'clear-shared') {
       clearSharedMemoryCommand();
     } else {

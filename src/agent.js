@@ -11,7 +11,7 @@ import { chat, liveModels, listModels, getFinishReason } from './api.js';
 import { parseRef, makeRef, shortName, iconFor } from './models.js';
 import { spinner, printReply } from './ui.js';
 import { buildSystem, setActiveConversation, activeConversationId } from './context.js';
-import { sessionPath, memoryPath, globalMemoryPath, defaultConversationId, createConversation, listConversations, loadMeta, touchMeta, autoTitle, deleteConversation, appendToSharedMemory, sharedMemoryPath, clearSharedMemory, saveAgentsData, loadAgentsData, addMessageToConv } from './convos.js';
+import { sessionPath, memoryPath, globalMemoryPath, defaultConversationId, createConversation, listConversations, loadMeta, touchMeta, autoTitle, deleteConversation, appendToSharedMemory, clearSharedMemory, saveAgentsData, loadAgentsData, addMessageToConv } from './convos.js';
 import { extractBlocks, expand, writeFile, run, killRunning, isDangerous, isReadOnly, checkSyntax } from './exec.js';
 
 const favs = getFavorites(FAVORITES);
@@ -30,7 +30,7 @@ const seenCmds = new Map();
 const memoryTargets = () => [memoryPath(S.convId), globalMemoryPath()].filter(Boolean);
 const isMemoryFile = (full) => memoryTargets().includes(full);
 
-const BASE_CMDS = ['/help', '/live', '/use ', '/top', '/fav ', '/file ', '/paste', '/cd ', '/auto', '/assistant', '/stop', '/api ', '/apihorde ', '/apisearch ', '/save', '/clear', '/resume', '/new', '/delconv ', '/exit', '/agents', '/agent ', '/supervise '];
+const BASE_CMDS = ['/help', '/live', '/use ', '/top', '/fav ', '/file ', '/paste', '/cd ', '/auto', '/assistant', '/stop', '/api ', '/apihorde ', '/apisearch ', '/save', '/clear', '/resume', '/new', '/delconv ', '/exit', '/agents', '/agents watch', '/agent ', '/supervise '];
 const completer = (l) => {
   const all = [...BASE_CMDS, ...S.favs.map((_, i) => `/${i + 1}`)];
   const h = all.filter(c => c.startsWith(l));
@@ -49,7 +49,8 @@ export const ask = (q, raw = false) => new Promise((resolve) => {
 });
 export const askRaw = (q) => ask(q, true);
 
-// Interrompt l'IA : requête en cours, commande en cours, question en attente
+// Interrompt l'IA du premier plan : requête en cours, commande en cours, question en attente.
+// Les agents en tâche de fond ne sont PAS touchés par /stop (chacun s'arrête avec /agent stop <n°>).
 export function interrupt() {
   S.stopped = true;
   console.log(chalk.yellow('\n⛔ Interruption…'));
@@ -277,6 +278,9 @@ async function doCmd(b) {
 
 async function handleBlocks(reply) {
   await doSearches(reply);
+  // Délégation / supervision d'agents demandée par l'IA dans sa réponse :
+  // blocs ```agent (lancer) et lignes /agents, /agent stop|resume|msg|new (piloter).
+  for (const f of processAgentControl(reply, null)) S.pending.push(f);
   for (const b of extractBlocks(reply)) {
     if (S.stopped) break;
     if (b.type === 'file') await doFile(b);
@@ -461,15 +465,19 @@ export function newConversation() {
   return S.convId;
 }
 
-// Au lancement : conversation la plus récente (créée/migrée si besoin), puis reprise de sa session.
+// Au lancement : conversation la plus récente (créée/migrée si besoin), puis reprise de sa session
+// et de son groupe d'agents (restaurés en pause, prêts à reprendre avec /agent resume <n°>).
 export function initConversations() {
   S.convId = defaultConversationId();
   setActiveConversation(S.convId);
   refreshSystem();
-  return loadSession();
+  const n = loadSession();
+  const restored = restoreAgentsFromConv(S.convId);
+  if (restored.length) console.log(chalk.gray(`↺ ${restored.length} agent(s) de cette conversation restauré(s) en pause (/agents, /agent resume <n°>).`));
+  return n;
 }
 
-// /resume [n°] : liste les conversations ou bascule sur l'une d'elles
+// /resume [n°] : liste les conversations ou bascule sur l'une d'elles (avec son groupe d'agents)
 export async function resumeCommand(arg) {
   const list = listConversations();
   if (!list.length) return console.log(chalk.gray('Aucune conversation enregistrée.'));
@@ -486,16 +494,12 @@ export async function resumeCommand(arg) {
   }
   if (!list.some(c => c.id === n)) return console.log(chalk.red(`Pas de conversation n°${n}. /resume pour la liste.`));
   const count = switchConversation(n);
-
-  // Restaurer les agents sauvegardés dans cette conversation
-  const restoredAgents = restoreAgentsFromConv(n);
-  if (restoredAgents.length > 0) {
-    console.log(chalk.green(`↺ ${restoredAgents.length} agent(s) restauré(s) depuis cette conversation.`));
-    restoredAgents.forEach(a => {
-      console.log(chalk.gray(`   Agent #${a.id} : ${a.task} (${a.status})`));
-    });
+  // Le groupe d'agents de cette conversation revient avec elle (en pause, /agent resume <n°> pour reprendre)
+  const restored = restoreAgentsFromConv(n);
+  if (restored.length) {
+    console.log(chalk.green(`↺ ${restored.length} agent(s) restauré(s) avec cette conversation (en pause).`));
+    for (const a of restored) console.log(chalk.gray(`   Agent #${a.id}${a.isSupervisor ? ' 👑' : ''} : ${a.task.slice(0, 70)}`));
   }
-
   console.log(count
     ? chalk.green(`↺ Conversation #${n} reprise (${count} messages).`)
     : chalk.green(`↺ Conversation #${n} ouverte (vide).`));
@@ -519,6 +523,10 @@ export async function delConvCommand(arg) {
   console.log(chalk.yellow(`⚠ Conversation #${n} « ${meta?.title || '(sans titre)'} » : session ET fichier mémoire seront supprimés définitivement.`));
   if (!(await confirm('Supprimer ?'))) return;
   if (!deleteConversation(n)) return console.log(chalk.red('✘ Suppression impossible.'));
+  // Les agents rattachés à cette conversation disparaissent avec elle
+  for (const a of [...agents.values()]) {
+    if (a.convId === n) { a.ctrl?.abort(); agents.delete(a.id); if (supervisorId === a.id) supervisorId = null; }
+  }
   console.log(chalk.green(`✔ Conversation #${n} supprimée (mémoire incluse). Le numéro ne sera pas réutilisé.`));
   if (n === S.convId) {
     const id = newConversation();
@@ -533,265 +541,441 @@ export async function pickStrongest() {
   } catch { return "koboldcpp/Llama-3.3-70B-Instruct"; }
 }
 
-// ========== SYSTÈME MULTI-AGENTS AVEC SUPERVISEUR IA ==========
+// ========== SYSTÈME MULTI-AGENTS (arrière-plan, non bloquant) ==========
+// Chaque agent : sa tâche, son modèle, son mode de risque, sa conversation de rattachement.
+// L'IA (conversation principale ou superviseur) peut elle-même lancer des agents via des blocs
+// ```agent et les piloter via des lignes /agent ... (voir processAgentControl plus bas).
 
 export const agents = new Map();
-let supervisorId = null; // ID de l'agent superviseur (null si aucun)
+let supervisorId = null;
+const nextAgentId = () => (agents.size ? Math.max(...agents.keys()) + 1 : 1);
 
-// Crée et lance un nouvel agent en tâche de fond (non-bloquant)
-export function createAgent(task, modelRef, mode, isSupervisor = false) {
-  const id = agents.size > 0 ? Math.max(...agents.keys()) + 1 : 1;
-  const convId = S.convId; // L'agent utilise la conversation courante
+// Exécution isolée pour les agents : ne touche pas au processus courant de exec.js (réservé au
+// premier plan), PAS de timeout (comme run()), sortie capturée pour être renvoyée au modèle.
+const execCapture = (cmd, cwd) => new Promise((resolve) => {
+  exec(cmd, { cwd, shell: 'bash', maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    const out = `${stdout || ''}${stderr ? '\n' + stderr : ''}`.trim();
+    resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, out: out.slice(-2500) });
+  });
+});
 
+// Prompt système d'un agent : contexte complet (mémoire globale + partagée + capacité agents)
+// + son rôle. Reconstruit à chaque étape pour voir les nouveautés de la mémoire partagée.
+function agentSystemPrompt(agent) {
+  const role = agent.isSupervisor
+    ? "RÔLE : SUPERVISEUR — tu délègues aux agents, tu vérifies leur travail, tu les recadres (msg) ou les arrêtes s'ils dévient de la tâche. Respecte les préférences durables de la mémoire globale de l'utilisateur."
+    : "RÔLE : AGENT DE TÂCHE — exécute uniquement ta tâche, sans bavardage, sans empiéter sur le travail des autres agents.";
+  return buildSystem(parseRef(agent.modelRef).provider, false, true)
+    + '\n' + role
+    + "\nSTYLE : une phrase courte décrivant l'action en cours + le bloc d'action. C'est tout. Quand la tâche est finie et vérifiée, termine ta réponse par TERMINÉ seul sur la dernière ligne.";
+}
+
+// Crée et lance un agent en tâche de fond (non bloquant : le prompt principal reste disponible)
+export function createAgent(task, modelRef, mode, isSupervisor = false, parentId = null) {
+  const id = nextAgentId();
   const agent = {
-    id,
-    task,
-    modelRef,
-    mode, // 'auto' ou 'safe'
-    status: 'running', // 'running', 'paused', 'stopped', 'finished'
-    convId,
-    lastAction: 'Initialisation...',
-    messages: [{ role: 'system', content: `Tu es un agent autonome. Tâche: ${task}. Mode: ${mode}.` }],
-    isSupervisor,
-    subAgents: isSupervisor ? [] : undefined // Liste des sous-agents pour le superviseur
+    id, task, modelRef, mode,
+    status: 'running', // running | paused | stopped | finished
+    convId: S.convId,
+    cwd: process.cwd(), // dossier figé au lancement (un /cd du premier plan ne le déplace pas)
+    lastAction: 'Initialisation…',
+    isSupervisor, parentId,
+    pendingAction: null, ctrl: null, loopRunning: false,
+    messages: []
   };
-
+  agent.messages = [
+    { role: 'system', content: agentSystemPrompt(agent) },
+    { role: 'user', content: `TÂCHE : ${task}\nCommence maintenant. Une phrase + l'action à chaque étape.` }
+  ];
   agents.set(id, agent);
-  console.log(`\n✅ [Agent ${id}${isSupervisor ? ' (SUPERVISEUR)' : ''}] Démarré avec le modèle ${modelRef}. Tâche: "${task}"`);
-
-  if (isSupervisor) {
-    supervisorId = id;
-  }
-
-  // Sauvegarder l'agent dans la conversation
+  if (isSupervisor) supervisorId = id;
+  console.log(chalk.green(`\n✅ [Agent ${id}${isSupervisor ? ' 👑' : ''}] ${shortName(modelRef)} · ${mode} · ${task.slice(0, 80)}`));
   saveAgentsToConv();
-
-  // Lancer la boucle en arrière-plan (non-bloquant pour le main thread)
   runAgentLoop(agent);
   return agent;
 }
 
-// Boucle asynchrone d'un agent
+// "modèle auto" / "modèle safe" / "modèle" / "" → référence + mode (défaut : modèle actuel, auto)
+function parseAgentSpec(spec) {
+  let modelRef = S.model, mode = 'auto';
+  const tokens = (spec || '').trim().split(/\s+/).filter(Boolean);
+  if (tokens.length) {
+    const last = tokens[tokens.length - 1].toLowerCase();
+    if (last === 'auto' || last === 'safe') { mode = last; tokens.pop(); }
+    if (tokens.length) modelRef = tokens.join(' ');
+  }
+  return { modelRef, mode };
+}
+
+// Photo de tous les agents, en texte brut (renvoyée au modèle qui demande /agents)
+function agentsReport() {
+  const list = getAllAgents();
+  if (!list.length) return 'Aucun agent.';
+  return list.map(a =>
+    `#${a.id}${a.isSupervisor ? ' (superviseur)' : ''} [${a.status}] ${shortName(a.modelRef)} · tâche: ${a.task} · dernier: ${a.lastAction}`
+  ).join('\n');
+}
+
+// Profondeur de délégation (agent → sous-agent → ...) : garde-fou anti-récursion, pas une limite
+// sur le nombre d'agents en parallèle (il n'y en a pas).
+function agentDepth(a) {
+  let d = 0, cur = a;
+  while (cur && cur.parentId != null && d < 10) { cur = agents.get(cur.parentId); d++; }
+  return d;
+}
+
+// Exécute les demandes de délégation / supervision trouvées dans une réponse d'IA.
+// fromAgent = null → conversation principale ; sinon l'agent auteur (ne peut pas agir sur lui-même).
+// Retourne des messages de résultat à réinjecter dans la conversation de l'auteur.
+function processAgentControl(reply, fromAgent) {
+  const feedback = [];
+  const blocks = [...reply.matchAll(/```agent(?::([^\n]+))?\n([\s\S]*?)```/g)];
+  const directives = [];
+  for (const line of reply.split('\n')) {
+    const l = line.trim();
+    let m;
+    if (l === '/agents') directives.push({ type: 'list' });
+    else if ((m = /^\/agent\s+stop\s+(\d+)\s*$/i.exec(l))) directives.push({ type: 'stop', id: +m[1] });
+    else if ((m = /^\/agent\s+resume\s+(\d+)\s*$/i.exec(l))) directives.push({ type: 'resume', id: +m[1] });
+    else if ((m = /^\/agent\s+msg\s+(\d+)\s+(.+)$/i.exec(l))) directives.push({ type: 'msg', id: +m[1], text: m[2].replace(/^"|"$/g, '') });
+    else if ((m = /^\/agent\s+new\s+(\S+)\s+(auto|safe)\s+(.+)$/i.exec(l))) directives.push({ type: 'new', model: m[1], mode: m[2].toLowerCase(), task: m[3].replace(/^"|"$/g, '') });
+  }
+  if (!blocks.length && !directives.length) return feedback;
+  if (!fromAgent && S.simple) return ['[Délégation ignorée : le mode assistant est actif, aucun accès au système. /assistant pour repasser en mode agent complet.]'];
+  const spawn = (task, modelRef, mode) => {
+    if (fromAgent && agentDepth(fromAgent) >= 4) { feedback.push('[Refusé : profondeur de délégation maximale atteinte (4). Fais le travail toi-même ou via un agent existant.]'); return; }
+    const a = createAgent(task, modelRef, mode, false, fromAgent ? fromAgent.id : null);
+    feedback.push(`[Agent #${a.id} lancé (${shortName(modelRef)}, ${mode}) : ${a.task}]`);
+  };
+  for (const b of blocks) {
+    const task = b[2].trim();
+    if (!task) { feedback.push('[Agent non lancé : tâche vide dans le bloc agent.]'); continue; }
+    const { modelRef, mode } = parseAgentSpec(b[1]);
+    spawn(task, modelRef, mode);
+  }
+  for (const d of directives) {
+    if (d.type === 'list') { feedback.push(`[État des agents :\n${agentsReport()}]`); continue; }
+    if (d.type === 'new') { spawn(d.task, d.model, d.mode); continue; }
+    const target = agents.get(d.id);
+    if (!target) { feedback.push(`[Agent #${d.id} introuvable.]`); continue; }
+    if (fromAgent && target.id === fromAgent.id) { feedback.push('[Refusé : un agent ne peut pas agir sur lui-même via commande.]'); continue; }
+    if (d.type === 'stop') feedback.push(stopAgent(d.id) ? `[Agent #${d.id} arrêté.]` : `[Agent #${d.id} déjà arrêté ou terminé.]`);
+    else if (d.type === 'resume') feedback.push(resumeAgent(d.id) ? `[Agent #${d.id} relancé.]` : `[Agent #${d.id} non relançable (statut ${target.status}).]`);
+    else if (d.type === 'msg') {
+      const src = fromAgent ? `superviseur #${fromAgent.id}` : "utilisateur";
+      target.messages.push({ role: 'user', content: `[MESSAGE du ${src}] : ${d.text}` });
+      feedback.push(`[Message transmis à l'agent #${d.id}${target.status === 'running' ? '' : ' (en pause : lu à sa reprise)'}]`);
+    }
+  }
+  return feedback;
+}
+
+// Une réponse se termine quand sa DERNIÈRE ligne est TERMINÉ (ou "tâche terminée"),
+// pas quand le mot apparaît au milieu d'une phrase.
+function isFinishedReply(reply) {
+  const lines = reply.trim().split('\n').map(s => s.trim()).filter(Boolean);
+  const last = (lines[lines.length - 1] || '').replace(/[.!?]+$/, '');
+  return /^terminé$/i.test(last) || /^tâche terminée$/i.test(last);
+}
+
+// Met un agent en pause avec une action en attente : /agent resume <n°> = valider et continuer,
+// /agent stop <n°> = annuler. Utilisé pour le mode safe ET les garde-fous (danger, clés, # CONFIRM).
+function pauseForValidation(agent, action, why) {
+  agent.pendingAction = action;
+  agent.status = 'paused';
+  agent.lastAction = `En attente de validation : ${why}`;
+  console.log(chalk.yellow(`\n⏸️ [Agent ${agent.id}] ${why}`));
+  console.log(chalk.gray(`   /agent resume ${agent.id} = valider et continuer · /agent stop ${agent.id} = annuler`));
+  saveAgentsToConv();
+}
+
+// Boucle asynchrone d'un agent : appelle son modèle, exécute ses blocs, LUI RENVOIE les résultats
+// (sans ça l'agent travaillerait à l'aveugle), et continue jusqu'à TERMINÉ, pause ou erreur.
 async function runAgentLoop(agent) {
-  while (agent.status === 'running') {
-    try {
-      const { provider } = parseRef(agent.modelRef);
-      const systemPrompt = buildSystem(provider, false, true); // isAgent = true
-
-      // Appel à l'API
-      const responseText = await chat(agent.modelRef, agent.messages, null);
-
-      agent.messages.push({ role: 'assistant', content: responseText });
-      addMessageToConv(agent.convId, 'assistant', responseText);
-
-      // Parser l'action
-      const action = parseAgentAction(responseText);
-
-      if (action.command) {
-        if (agent.mode === 'safe') {
-          agent.lastAction = `En attente de validation : ${action.explanation}`;
-          console.log(`\n⏸️ [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] En attente de validation : ${action.explanation}`);
-          console.log(`   Commande : ${action.command}`);
-          agent.status = 'paused';
-          saveAgentsToConv();
-          break;
-        } else {
-          agent.lastAction = action.explanation;
-          console.log(`\n⚡ [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] ${action.explanation}`);
-          console.log(`   $ ${action.command}`);
-
-          // Exécution de la commande (sans timeout, utilise exec direct pour les agents)
-          exec(action.command, { cwd: process.cwd() }, (err, stdout, stderr) => {
-            const result = err ? `ÉCHEC: ${stderr || err.message}` : `SUCCÈS: ${stdout.trim() || 'OK'}`;
-            appendToSharedMemory(agent.id, `${action.explanation} -> ${result}`);
-            addMessageToConv(agent.convId, 'system', `Commande exécutée: ${action.command}\nRésultat: ${result}`);
-          });
-        }
-      } else {
-        agent.lastAction = action.explanation || 'Réflexion en cours...';
-        console.log(`\n💬 [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] ${agent.lastAction}`);
-        appendToSharedMemory(agent.id, agent.lastAction);
+  if (agent.loopRunning) return; // une seule boucle par agent
+  agent.loopRunning = true;
+  try {
+    while (agent.status === 'running') {
+      agent.messages[0] = { role: 'system', content: agentSystemPrompt(agent) };
+      if (agent.messages.length > 17) {
+        agent.messages = [agent.messages[0], ...agent.messages.slice(-12)];
+        while (agent.messages[1] && agent.messages[1].role !== 'user') agent.messages.splice(1, 1);
       }
-
-      if (action.isFinished) {
+      agent.ctrl = new AbortController();
+      let reply;
+      try { reply = await chat(agent.modelRef, agent.messages, agent.ctrl.signal); }
+      finally { agent.ctrl = null; }
+      if (agent.status !== 'running') break; // arrêté pendant l'appel
+      if (!reply) throw new Error('Réponse vide.');
+      agent.messages.push({ role: 'assistant', content: reply });
+      addMessageToConv(agent.convId, 'assistant', `[Agent ${agent.id}] ${reply}`);
+      const feedback = [];
+      // 1) Délégation / supervision (blocs agent + lignes /agent...)
+      feedback.push(...processAgentControl(reply, agent));
+      // Phrase d'avancement : première ligne non vide hors bloc (une seule phrase affichée)
+      const phrase = (reply.trim().split('\n').find(l => l.trim() && !l.trim().startsWith('```')) || 'Action…').trim().slice(0, 100);
+      // 2) Blocs file: et bash, avec les MÊMES garde-fous que le premier plan
+      for (const b of extractBlocks(reply)) {
+        if (agent.status !== 'running') break;
+        if (b.type === 'file') { await agentFileBlock(agent, b, feedback); continue; }
+        if (/(node\s+|\.\/)index\.js/.test(b.code)) { feedback.push('[Refusé : node index.js relance ce CLI interactif. Utilise node --check index.js.]'); continue; }
+        const danger = isDangerous(b.code);
+        const secret = /\.horde_settings/.test(b.code);
+        const force = /^\s*#\s*CONFIRM\b/i.test(b.code);
+        if (danger || secret || force || agent.mode === 'safe') {
+          const why = danger ? 'commande dangereuse' : secret ? 'fichier de clés API' : force ? 'validation demandée (# CONFIRM)' : 'mode safe';
+          pauseForValidation(agent, { kind: 'bash', code: b.code }, `${why} : ${b.code.split('\n')[0].slice(0, 70)}`);
+          feedback.push('[Action en attente de validation utilisateur, non exécutée.]');
+          break;
+        }
+        agent.lastAction = phrase;
+        console.log(chalk.blue(`\n⚡ [Agent ${agent.id}] ${phrase}`));
+        console.log(chalk.gray(`   $ ${b.code.split('\n')[0]}${b.code.includes('\n') ? ' …' : ''}`));
+        const r = await execCapture(b.code, agent.cwd);
+        appendToSharedMemory(agent.id, `${phrase} -> code ${r.code}`);
+        feedback.push(`[Commande exécutée : ${b.code}\nCode de sortie : ${r.code}\nSortie :\n${r.out}]`);
+      }
+      // 3) Blocs append: (suite de fichier), mêmes garde-fous
+      if (agent.status === 'running') await agentAppends(agent, reply, feedback);
+      // Résultats renvoyés à l'agent (même en cas de pause : il saura ce qui a été fait)
+      if (feedback.length) {
+        const msg = feedback.join('\n\n');
+        agent.messages.push({ role: 'user', content: msg });
+        addMessageToConv(agent.convId, 'user', `[Agent ${agent.id}] ${msg}`);
+      }
+      if (agent.status !== 'running') { saveAgentsToConv(); break; }
+      if (isFinishedReply(reply)) {
         agent.status = 'finished';
         agent.lastAction = 'Tâche terminée.';
-        console.log(`\n🏁 [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Tâche terminée avec succès.`);
-        appendToSharedMemory(agent.id, 'Tâche principale terminée.');
+        console.log(chalk.green(`\n🏁 [Agent ${agent.id}] Tâche terminée.`));
+        appendToSharedMemory(agent.id, `TÂCHE TERMINÉE : ${agent.task}`);
         saveAgentsToConv();
         break;
       }
-
-      // Petite pause pour éviter de spammer l'API
-      await new Promise(r => setTimeout(r, 2000));
-
-    } catch (err) {
-      agent.lastAction = `Erreur: ${err.message}`;
-      console.log(`\n❌ [Agent ${agent.id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Erreur critique : ${err.message}`);
-      agent.status = 'paused';
+      if (!feedback.length) agent.messages.push({ role: 'user', content: 'Poursuis la tâche (une phrase + action), ou termine par TERMINÉ seul sur la dernière ligne si fini.' });
       saveAgentsToConv();
+      await new Promise(r => setTimeout(r, 1500)); // petite pause anti-spam API
+    }
+  } catch (err) {
+    if (agent.status === 'running') {
+      agent.status = 'paused';
+      agent.lastAction = `Erreur : ${err.message}`;
+      console.log(chalk.red(`\n❌ [Agent ${agent.id}] ${err.message} — /agent resume ${agent.id} pour réessayer.`));
+    }
+    saveAgentsToConv();
+  } finally {
+    agent.loopRunning = false;
+  }
+}
+
+// Écriture de fichier par un agent : mêmes règles que doFile (mémoire JSON valide, clés API et
+// raccourcissement suspect → validation), mais sans JAMAIS prendre la main sur le readline.
+async function agentFileBlock(agent, b, feedback) {
+  const full = expand(b.path);
+  const isMem = [memoryPath(agent.convId), globalMemoryPath()].includes(full);
+  const secret = full === SETTINGS_FILE;
+  if (isMem) {
+    try { JSON.parse(b.code); }
+    catch (e) { feedback.push(`[Fichier ${b.path} NON écrit : JSON invalide (${e.message}). Renvoie le contenu COMPLET en JSON valide.]`); return; }
+  }
+  let shrink = false;
+  try {
+    if (!isMem && !secret && fs.existsSync(full)) {
+      const oldLen = fs.statSync(full).size;
+      const newLen = Buffer.byteLength(b.code, 'utf-8');
+      if (oldLen > 200 && newLen < oldLen * 0.5) shrink = true;
+    }
+  } catch {}
+  if (secret || shrink || (!isMem && agent.mode === 'safe')) {
+    const why = secret ? 'fichier de clés API' : shrink ? 'raccourcissement suspect' : 'mode safe';
+    pauseForValidation(agent, { kind: 'file', path: b.path, code: b.code }, `écrire ${b.path} (${why})`);
+    feedback.push('[Écriture en attente de validation utilisateur, non effectuée.]');
+    return;
+  }
+  try {
+    writeFile(b.path, b.code);
+    console.log(chalk.green(`\n📝 [Agent ${agent.id}] ${b.path} (${b.code.split('\n').length} lignes)`));
+    appendToSharedMemory(agent.id, `écriture ${b.path}`);
+    feedback.push(`[Fichier ${b.path} écrit avec succès]`);
+    if (!isMem && !secret) {
+      const err = await checkSyntax(full);
+      if (err) feedback.push(`[Vérification automatique de ${b.path} :\n${err}\nCorrige ce fichier si besoin.]`);
+    }
+  } catch (e) {
+    feedback.push(`[Échec de l'écriture de ${b.path} : ${e.message}]`);
+  }
+}
+
+// Blocs append: d'un agent (suite d'un fichier long), mêmes garde-fous.
+async function agentAppends(agent, reply, feedback) {
+  const re = /```append:([^\n]+)\n([\s\S]*?)```/g;
+  let m;
+  while ((m = re.exec(reply))) {
+    if (agent.status !== 'running') break;
+    const p = m[1].trim();
+    const code = m[2].replace(/\n$/, '');
+    const full = expand(p);
+    if ([memoryPath(agent.convId), globalMemoryPath()].includes(full)) {
+      feedback.push(`[Append refusé sur ${p} : réécris la mémoire en entier avec un bloc file: en JSON valide.]`);
+      continue;
+    }
+    const secret = full === SETTINGS_FILE;
+    if (secret || agent.mode === 'safe') {
+      pauseForValidation(agent, { kind: 'append', path: p, code }, `ajouter à ${p}${secret ? ' (fichier de clés API)' : ' (mode safe)'}`);
+      feedback.push('[Ajout en attente de validation utilisateur, non effectué.]');
       break;
+    }
+    try {
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.appendFileSync(full, code + '\n');
+      console.log(chalk.green(`\n➕ [Agent ${agent.id}] ${p} (suite ajoutée)`));
+      appendToSharedMemory(agent.id, `ajout à ${p}`);
+      feedback.push(`[Suite ajoutée à ${p} avec succès]`);
+      const err = await checkSyntax(full);
+      if (err) feedback.push(`[Vérification automatique de ${p} :\n${err}\nCorrige ce fichier si besoin.]`);
+    } catch (e) {
+      feedback.push(`[Échec de l'ajout à ${p} : ${e.message}]`);
     }
   }
 }
 
-// Parse la réponse de l'IA pour extraire commande et explication
-function parseAgentAction(text) {
-  const bashMatch = text.match(/```(?:bash|sh)?\n([\s\S]*?)\n```/i);
-  const commandMatch = text.match(/COMMAND:\s*(.+)/i);
-  const actionMatch = text.match(/ACTION:\s*(.+)/i);
-
-  let command = null;
-  let explanation = 'Action en cours...';
-  let isFinished = false;
-
-  if (bashMatch) {
-    command = bashMatch[1].trim();
-  } else if (commandMatch) {
-    command = commandMatch[1].trim();
-  }
-
-  if (actionMatch) {
-    explanation = actionMatch[1].trim();
-  } else {
-    // Prend la première phrase comme explication
-    explanation = text.split('\n')[0].replace(/^[#\-\*]\s*/, '').trim();
-  }
-
-  if (text.toLowerCase().includes('tâche terminée') || text.toLowerCase().includes('task finished') || text.toLowerCase().includes('terminé')) {
-    isFinished = true;
-  }
-
-  return { command, explanation, isFinished };
+// Arrête un agent (interrompt aussi son appel API en cours). Utilisable à tout moment,
+// même pendant que l'IA du premier plan travaille.
+export function stopAgent(id) {
+  const a = agents.get(id);
+  if (!a || (a.status !== 'running' && a.status !== 'paused')) return false;
+  a.status = 'stopped';
+  a.lastAction = 'Arrêté.';
+  a.pendingAction = null;
+  a.ctrl?.abort();
+  if (a.isSupervisor && supervisorId === id) supervisorId = null;
+  console.log(chalk.yellow(`\n🛑 [Agent ${id}] Arrêté.`));
+  saveAgentsToConv();
+  return true;
 }
 
-// Récupération et gestion des agents
+// Reprend un agent en pause / arrêté. S'il avait une action en attente de validation,
+// la reprise vaut VALIDATION : l'action est exécutée puis la boucle continue.
+export function resumeAgent(id) {
+  const a = agents.get(id);
+  if (!a || (a.status !== 'paused' && a.status !== 'stopped')) return false;
+  a.status = 'running';
+  console.log(chalk.green(`\n▶️ [Agent ${id}] Repris.`));
+  saveAgentsToConv();
+  if (a.pendingAction) { const p = a.pendingAction; a.pendingAction = null; executeApproved(a, p); }
+  else runAgentLoop(a);
+  return true;
+}
+
+// Exécute l'action validée par l'utilisateur (via /agent resume), puis relance la boucle.
+async function executeApproved(agent, p) {
+  const feedback = [];
+  try {
+    if (p.kind === 'bash') {
+      console.log(chalk.blue(`\n⚡ [Agent ${agent.id}] (validé) $ ${p.code.split('\n')[0]}`));
+      const r = await execCapture(p.code, agent.cwd);
+      appendToSharedMemory(agent.id, `(validé) ${p.code.split('\n')[0]} -> code ${r.code}`);
+      feedback.push(`[Action validée exécutée : ${p.code}\nCode de sortie : ${r.code}\nSortie :\n${r.out}]`);
+    } else {
+      const full = expand(p.path);
+      if (p.kind === 'append') { fs.mkdirSync(path.dirname(full), { recursive: true }); fs.appendFileSync(full, p.code + '\n'); }
+      else writeFile(p.path, p.code);
+      console.log(chalk.green(`\n📝 [Agent ${agent.id}] (validé) ${p.path}`));
+      appendToSharedMemory(agent.id, `(validé) écriture ${p.path}`);
+      const err = await checkSyntax(full);
+      feedback.push(`[Action validée : ${p.kind} ${p.path} appliqué.${err ? '\nVérification : ' + err : ''}]`);
+    }
+  } catch (e) {
+    feedback.push(`[Échec de l'action validée : ${e.message}]`);
+  }
+  agent.messages.push({ role: 'user', content: feedback.join('\n\n') });
+  saveAgentsToConv();
+  runAgentLoop(agent);
+}
+
 export function getAgent(id) { return agents.get(id); }
 export function getAllAgents() { return Array.from(agents.values()); }
 export function getSupervisor() { return supervisorId ? agents.get(supervisorId) : null; }
-
-export function stopAgent(id) {
-  const agent = agents.get(id);
-  if (agent && agent.status === 'running') {
-    agent.status = 'stopped';
-    agent.lastAction = 'Arrêté manuellement.';
-    console.log(`\n🛑 [Agent ${id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Arrêté.`);
-    if (agent.isSupervisor) supervisorId = null;
-    saveAgentsToConv();
-    return true;
-  }
-  return false;
-}
-
-export function resumeAgent(id) {
-  const agent = agents.get(id);
-  if (agent && (agent.status === 'paused' || agent.status === 'stopped')) {
-    agent.status = 'running';
-    console.log(`\n▶️ [Agent ${id}${agent.isSupervisor ? ' (SUPERVISEUR)' : ''}] Relancé.`);
-    runAgentLoop(agent);
-    saveAgentsToConv();
-    return true;
-  }
-  return false;
-}
 
 export function clearSharedMemoryCommand() {
   clearSharedMemory();
   console.log(chalk.green('✅ Mémoire partagée des agents effacée.'));
 }
 
-// ========== PERSISTANCE DES AGENTS DANS LA CONVERSATION ==========
-// Les agents sont sauvegardés dans agents.json (fichier séparé de session.json)
-// dans le dossier de la conversation, pour ne pas interférer avec les messages.
+// ========== PERSISTANCE : le groupe d'agents vit dans SA conversation ==========
+// Sauvegardé dans agents.json du dossier de la conversation (séparé de session.json).
+// Chaque conversation sauvegarde SES agents : changer de conversation ne mélange rien.
 
-// Sauvegarde tous les agents actifs dans la conversation courante
 export function saveAgentsToConv() {
-  if (S.convId == null) return;
-  const agentsData = Array.from(agents.values()).map(a => ({
-    id: a.id,
-    task: a.task,
-    modelRef: a.modelRef,
-    mode: a.mode,
-    status: a.status,
-    lastAction: a.lastAction,
-    isSupervisor: a.isSupervisor,
-    messages: a.messages.slice(-10) // Garder les 10 derniers messages pour le contexte
-  }));
-  saveAgentsData(S.convId, agentsData);
+  const byConv = new Map();
+  for (const a of agents.values()) {
+    if (a.convId == null) continue;
+    if (!byConv.has(a.convId)) byConv.set(a.convId, []);
+    byConv.get(a.convId).push({
+      id: a.id, task: a.task, modelRef: a.modelRef, mode: a.mode, status: a.status,
+      lastAction: a.lastAction, isSupervisor: a.isSupervisor, parentId: a.parentId, cwd: a.cwd,
+      messages: a.messages.slice(-10)
+    });
+  }
+  for (const [cid, data] of byConv) saveAgentsData(cid, data);
 }
 
-// Restaure les agents depuis une conversation (appelé par resumeCommand)
+// Restaure le groupe d'agents d'une conversation (appelé par /resume et au lancement).
+// Toujours en pause : pas d'appels API surprise à la reprise ; /agent resume <n°> pour repartir.
 export function restoreAgentsFromConv(convId) {
-  const savedAgents = loadAgentsData(convId);
-  if (!savedAgents || !Array.isArray(savedAgents) || savedAgents.length === 0) return [];
-
+  if ([...agents.values()].some(a => a.convId === convId)) return []; // déjà en mémoire
+  const saved = loadAgentsData(convId);
+  if (!Array.isArray(saved) || !saved.length) return [];
   const restored = [];
-  savedAgents.forEach(saved => {
-    // Ne restaurer que les agents qui étaient actifs ou en pause (pas ceux terminés/arrêtés)
-    if (saved.status === 'running' || saved.status === 'paused') {
-      const agent = {
-        id: saved.id,
-        task: saved.task,
-        modelRef: saved.modelRef,
-        mode: saved.mode,
-        status: 'paused', // Toujours démarrer en pause pour ne pas spammer l'API au démarrage
-        convId: convId,
-        lastAction: 'Restauré depuis session précédente',
-        messages: saved.messages || [{ role: 'system', content: `Tu es un agent autonome. Tâche: ${saved.task}.` }],
-        isSupervisor: saved.isSupervisor
-      };
-      agents.set(agent.id, agent);
-      restored.push(agent);
-      if (agent.isSupervisor) supervisorId = agent.id;
-      console.log(chalk.gray(`   Agent #${agent.id} restauré (en pause). /agent resume ${agent.id} pour le relancer.`));
+  for (const s of saved) {
+    if (s.status !== 'running' && s.status !== 'paused') continue;
+    let id = s.id;
+    while (agents.has(id)) id = nextAgentId();
+    const a = {
+      id, task: s.task, modelRef: s.modelRef, mode: s.mode,
+      status: 'paused', convId, cwd: s.cwd || process.cwd(),
+      lastAction: `Restauré (en pause) — /agent resume ${id} pour reprendre.`,
+      isSupervisor: !!s.isSupervisor, parentId: s.parentId ?? null,
+      pendingAction: null, ctrl: null, loopRunning: false,
+      messages: Array.isArray(s.messages) && s.messages.length ? s.messages : []
+    };
+    if (!a.messages.length || a.messages[0].role !== 'system') {
+      a.messages = [
+        { role: 'system', content: agentSystemPrompt(a) },
+        { role: 'user', content: `TÂCHE : ${a.task}\nReprends là où tu en étais.` }
+      ];
     }
-  });
+    agents.set(id, a);
+    if (a.isSupervisor) supervisorId = id;
+    restored.push(a);
+  }
   return restored;
 }
 
-// ========== SUPERVISEUR IA ==========
-// Le superviseur est une IA qui coordonne d'autres agents. Il peut créer, surveiller,
-// arrêter et relancer des sous-agents. Il se base sur la mémoire globale de l'utilisateur.
-
+// ========== SUPERVISEUR ==========
+// /supervise <modèle> "<tâche>" : une IA qui découpe, délègue à des agents, vérifie leur travail
+// et les recadre. Elle utilise les MÊMES mécanismes que l'IA principale (blocs agent + lignes /agent),
+// donc tout ce qu'elle demande est réellement exécuté par processAgentControl.
 export function createSupervisor(task, modelRef) {
-  const supervisorTask = `Tu es un SUPERVISEUR. Ta mission : ${task}
-
-TU PEUX :
-1. Créer des sous-agents avec la commande : /agent new <modèle> <auto|safe> "<tâche>"
-2. Voir l'état de tous les agents avec : /agents
-3. Arrêter un agent avec : /agent stop <id>
-4. Relancer un agent avec : /agent resume <id>
-5. Envoyer un message à un agent avec : /agent msg <id> "<message>"
-
-TU DOIS :
-- Analyser les besoins et déléguer aux agents appropriés
-- Vérifier leur travail régulièrement avec /agents
-- Les arrêter s'ils hallucinent ou dévient de la tâche
-- Te baser sur la mémoire globale de l'utilisateur pour respecter ses préférences
-- Coordonner les agents pour qu'ils ne fassent pas de travail en double
-
-Quand la tâche principale est terminée, dis "TERMINÉ".`;
-
-  return createAgent(supervisorTask, modelRef, 'auto', true);
+  const t = [
+    `SUPERVISION : ${task}`,
+    "Découpe en sous-tâches et délègue : bloc ```agent:<modèle> <auto|safe> puis la tâche complète (un agent par sous-tâche, modèle adapté au domaine : code, rédaction, analyse...).",
+    "Surveille : /agents sur sa propre ligne. Vérifie le travail produit avec des blocs ```bash (cat, node --check, git diff...).",
+    "Recadre un agent qui dérive ou hallucine : /agent msg <n°> \"consigne\". Arrête-le si nécessaire : /agent stop <n°>.",
+    "Respecte les préférences durables de la mémoire globale de l'utilisateur. Évite les doublons entre agents (mémoire partagée).",
+    "Quand TOUT est fini et vérifié : TERMINÉ seul sur la dernière ligne."
+  ].join('\n');
+  return createAgent(t, modelRef, 'auto', true);
 }
 
-// Envoie un message à un agent spécifique (utilisé par le superviseur ou l'utilisateur)
+// /agent msg <n°> "<message>" côté utilisateur : transmis à l'agent (lu à sa prochaine étape,
+// ou à sa reprise s'il est en pause).
 export function sendMessageToAgent(agentId, message) {
-  const agent = agents.get(agentId);
-  if (!agent) {
-    console.log(chalk.red(`\n❌ Agent #${agentId} introuvable.`));
-    return false;
-  }
-
-  if (agent.status !== 'running') {
-    console.log(chalk.yellow(`\n⚠ Agent #${agentId} n'est pas en cours d'exécution (statut: ${agent.status}).`));
-    return false;
-  }
-
-  // Ajouter le message comme une nouvelle instruction
-  agent.messages.push({ role: 'user', content: `[MESSAGE DU SUPERVISEUR/UTILISATEUR]: ${message}` });
-  addMessageToConv(agent.convId, 'user', `[MESSAGE POUR AGENT #${agentId}]: ${message}`);
-
-  console.log(chalk.green(`\n✉️ Message envoyé à l'agent #${agentId}.`));
+  const a = agents.get(agentId);
+  if (!a) { console.log(chalk.red(`\n❌ Agent #${agentId} introuvable.`)); return false; }
+  a.messages.push({ role: 'user', content: `[MESSAGE de l'utilisateur] : ${message}` });
+  addMessageToConv(a.convId, 'user', `[Message utilisateur pour agent #${agentId}] : ${message}`);
+  console.log(chalk.green(`\n✉️ Message transmis à l'agent #${agentId}${a.status === 'running' ? '' : ' (lu à sa reprise)'}.`));
+  saveAgentsToConv();
   return true;
 }

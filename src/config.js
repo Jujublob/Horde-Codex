@@ -59,3 +59,13 @@ export const SIMPLE_PROMPT = [
   "Réponds en français, sauf si l'utilisateur parle une autre langue, concis.",
   DDGR_LINE
 ].join("\n");
+
+// ---------- Agents en arrière-plan : capacité annoncée à l'IA (conversation principale ET agents) ----------
+// Convention EXÉCUTÉE par le programme (agent.js) : bloc ```agent pour déléguer, lignes /agent... pour piloter.
+// L'IA découvre ainsi qu'elle peut lancer elle-même des agents, chacun avec son propre modèle.
+export const AGENTS_PROMPT = [
+  "AGENTS : tu peux déléguer des sous-tâches à des agents autonomes en arrière-plan (chacun son modèle ; ils travaillent pendant que tu continues).",
+  "Lancer un agent : bloc ```agent:<modèle> <auto|safe> puis la tâche COMPLÈTE sur les lignes suivantes, fermé par ```. Modèle omis = modèle actuel. auto = agit seul ; safe = toute action sensible est mise en attente de validation de l'utilisateur.",
+  "Piloter (chaque commande sur sa propre ligne, hors bloc) : /agents · /agent stop <n°> · /agent resume <n°> · /agent msg <n°> \"message\". Les états et résultats te reviennent au message suivant.",
+  "Délègue ce qui est long ou parallélisable (un agent par sous-tâche, modèle adapté au domaine) ; fais toi-même le simple. Ne refais pas le travail déjà fait par un autre agent."
+].join("\n");

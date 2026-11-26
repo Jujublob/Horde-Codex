@@ -10,8 +10,6 @@ const CLOUD_LIMITS = { prompt: 16000, reply: 4096 };
 const MODELS_TIMEOUT_MS = 20000;
 
 let warnedTrunc = false;
-let lastFinish = null;
-export const getFinishReason = () => lastFinish;
 
 // Température basse quand l'IA travaille sur du code, fichiers ou commandes
 const CODE_HINT = /```|\.(js|sh|json|py|md|txt)\b|fichier|code|commande|Commande exécutée|Résultats ci-dessus/i;
@@ -114,6 +112,8 @@ async function postRetry(url, headers, body, signal) {
   }
 }
 
+// Retourne { text, finish } : la raison de fin est propre à CHAQUE appel (plus de variable
+// globale partagée entre le premier plan et les agents qui tournent en parallèle).
 async function openaiChat({ url, key, model, messages, limits, signal }) {
   const body = {
     model,
@@ -128,8 +128,7 @@ async function openaiChat({ url, key, model, messages, limits, signal }) {
     throw new Error(`Erreur renvoyée par l'API : ${typeof d.error === 'string' ? d.error : d.error.message || JSON.stringify(d.error)}`);
   }
   if (!d.choices?.length) throw new Error("Réponse inattendue de l'API (aucun 'choices').");
-  lastFinish = d.choices[0].finish_reason || null;
-  return d.choices[0].message?.content || '';
+  return { text: d.choices[0].message?.content || '', finish: d.choices[0].finish_reason || null };
 }
 
 // Claude exige : premier message "user", rôles qui alternent
@@ -157,17 +156,17 @@ async function anthropicChat({ base, key, model, messages, limits, signal }) {
   const headers = { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' };
   const d = await postRetry(base + '/messages', headers, body, signal);
   if (!Array.isArray(d.content)) throw new Error("Réponse inattendue de l'API (aucun 'content').");
-  lastFinish = d.stop_reason === 'max_tokens' ? 'length' : (d.stop_reason || null);
-  return d.content.filter(b => b.type === 'text').map(b => b.text).join('');
+  const text = d.content.filter(b => b.type === 'text').map(b => b.text).join('');
+  return { text, finish: d.stop_reason === 'max_tokens' ? 'length' : (d.stop_reason || null) };
 }
 
 const baseOf = (p) => p.baseUrl.replace(/\/+$/, '');
 const unknownProvider = (id) => new Error(`Fournisseur inconnu : « ${id} ». /api pour la liste.`);
 
-// ref : "nom" (AI Horde) ou "@fournisseur:nom" ; signal (optionnel) : permet à /stop d'interrompre
+// ref : "nom" (AI Horde) ou "@fournisseur:nom" ; signal (optionnel) : permet à /stop d'interrompre.
+// Retourne { text, finish }.
 export async function chat(ref, messages, signal) {
   const { provider, model } = parseRef(ref);
-  lastFinish = null;
   if (provider === 'horde') {
     return openaiChat({ url: API_URL, key: getHordeKey(), model, messages, limits: HORDE_LIMITS, signal });
   }

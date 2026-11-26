@@ -57,6 +57,7 @@ export function banner(model, auto, opts = {}) {
   console.log(kv('Recherche', opts.search
     ? fit(chalk.hex('#34d399')('● via API'), dim('  + ddgr'), vw)
     : chalk.hex('#34d399')('● ddgr (sans clé)')));
+  if (opts.agents > 0) console.log(kv('Agents', fit(chalk.hex('#34d399').bold(`${opts.agents} actif(s)`), dim('  /agents · /agents watch'), vw)));
   if (opts.simple) console.log(kv('Mode', chalk.hex('#fbbf24')('◇ Assistant (chat + recherche seulement)')));
   console.log(kv('Aide', fit(chalk.hex('#fbbf24')('/help'), dim('  ·  ') + chalk.hex('#fbbf24')('/stop') + dim(' interrompt l’IA'), vw)));
   console.log(bd('╰' + '─'.repeat(inner) + '╯'));
@@ -85,7 +86,7 @@ export function spinner(label) {
 
 // Les blocs file:/append:/search sont nos conventions internes, pas des langages réels : les
 // réécrire évite que le rendu plante en cherchant un surligneur pour "file:~/chemin".
-const sanitizeFences = (md) => md.replace(/```(?:file|append|search)(?::[^\n]*)?\n/g, '```\n');
+const sanitizeFences = (md) => md.replace(/```(?:file|append|search|agent)(?::[^\n]*)?\n/g, '```\n');
 
 export function printReply(reply) {
   const w = Math.min(process.stdout.columns || 60, 72);
@@ -127,12 +128,27 @@ export function help(favs = []) {
 
   section('Conversations (mémoire séparée par conversation)');
   row('/resume', 'Lister toutes les conversations');
-  row('/resume <n°>', 'Reprendre une conversation (avec sa mémoire)');
+  row('/resume <n°>', 'Reprendre une conversation (avec sa mémoire et ses agents)');
   row('/new', 'Nouvelle conversation (numéro automatique, jamais réutilisé)');
   row('/delconv <n°>', 'Supprimer une conversation ET son fichier mémoire');
 
+  section('Agents (tâches en arrière-plan, non bloquant)');
+  row('/agent new <modèle> <auto|safe> "<tâche>"', 'Lancer un agent dédié');
+  row('/agents', 'Tableau de bord de tous les agents');
+  row('/agents watch', 'Surveillance en temps réel (Ctrl+C pour quitter)');
+  row('/agent show <n°>', 'Voir les derniers échanges d’un agent (sans l’arrêter)');
+  row('/agent stop <n°>', 'Arrêter un agent');
+  row('/agent resume <n°>', 'Relancer / valider l’action en attente d’un agent');
+  row('/agent msg <n°> "<message>"', 'Parler à un agent');
+  row('/supervise <modèle> "<tâche>"', 'Lancer une IA superviseur qui délègue et vérifie');
+  row('/agent auto <n°>', 'Accorder 10 étapes autonomes puis pause (superviseur)');
+  row('/agent valid <n°>', 'Chaque action de l’agent doit être validée par le superviseur');
+  row('/agent allow <n°> / deny <n°>', 'Autoriser / refuser l’action en attente (superviseur)');
+  row('/agent user <n°>', 'Rendre le contrôle à l’utilisateur');
+  row('/agent clear-shared', 'Vider la mémoire partagée entre agents');
+
   section('Contrôle de l’IA');
-  row('/stop', 'Interrompre l’IA (même en mode auto)');
+  row('/stop', 'Interrompre l’IA du premier plan (les agents continuent)');
   row('/auto', 'Mode auto : activer / désactiver');
   row('Ctrl+C', 'Idem /stop ; 2 fois de suite = quitter');
 

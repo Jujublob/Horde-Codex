@@ -1,6 +1,15 @@
 # Journal des modifications — HordeCLI (anciennement Horde Codex)
 
-Numérotation indicative (pas de tags Git officiels tant que tu ne les poses pas toi-même).
+
+
+
+## 1.10.1 — Correctifs issus d'un test réel (modèle Horde qui délègue)
+- **Rendu markdown** : le bloc ```agent ne provoque plus « Could not find the language » (déjà corrigé dans ui.js 1.10.0 — pense à l'appliquer).
+- **Référence de modèle clarifiée dans le prompt** : un nom sans @ est un modèle AI Horde ; pour le cloud il faut @fournisseur:modèle (ex : @openai:gpt-4o). Dans le doute, omettre le modèle (modèle actuel). Fini le « gpt-4o » envoyé à Horde qui échoue.
+- **Directives /agents et /agent ... mises par erreur dans un bloc bash** : elles sont désormais redirigées vers le contrôle d'agents au lieu d'être exécutées comme commande shell (plus de « Exécuter ? » pour /agents).
+- **Anti-hallucination renforcé** : le prompt interdit d'affirmer qu'un agent a réussi ou qu'un fichier existe sans vérification (/agents, /agent show, ls/cat). « Un agent lancé n'est PAS un agent terminé. »
+- **Résultat réel des agents renvoyé à l'IA principale** : quand un agent se termine ou tombe en pause/erreur, son état réel est transmis au superviseur (s'il tourne) sinon à la conversation principale — l'IA ne peut plus croire à tort que la tâche a réussi.
+- **Troncature du prompt agent sur Horde** : le RÔLE, le STYLE et la supervision sont placés EN TÊTE du prompt système de l'agent (ils survivent à la troncature du budget de tokens) ; la mémoire partagée est remontée juste après le prompt de base.
 
 ## 1.10.0 — Aide agents, API par appel, /agent show, contrôle d'autonomie par le superviseur
 - **`/help` : nouvelle section « Agents »** listant toutes les commandes (new, agents, watch, show, stop, resume, msg, supervise, auto, valid, allow, deny, user, clear-shared). Le bandeau affiche aussi une ligne « Agents : N actif(s) » quand des agents tournent.

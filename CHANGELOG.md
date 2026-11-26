@@ -2,28 +2,31 @@
 
 Numérotation indicative (pas de tags Git officiels tant que tu ne les poses pas toi-même).
 
+## 1.9.1 — Correctif de syntaxe, l'IA lance elle-même des agents, fiabilité du multi-agents
+- **Correctif bloquant** : apostrophe droite introduite par erreur dans `index.js` (`d'espace` au lieu de `d’espace`) → `SyntaxError` au démarrage. Corrigé (2 occurrences). Tout le nouveau code a été validé syntaxiquement avec un moteur JavaScript réel avant livraison.
+- **L'IA sait maintenant qu'elle peut lancer des agents** : nouveau `AGENTS_PROMPT` (config.js) injecté dans le prompt système de la conversation principale ET des agents (sauf mode assistant). Convention unique : bloc ```agent:<modèle> <auto|safe> pour déléguer, lignes /agents, /agent stop|resume|msg|new pour piloter.
+- **Ces demandes sont réellement exécutées** : `processAgentControl` parse les réponses de n'importe quelle IA (principale, superviseur, agent) et exécute les délégations/commandes ; les états et résultats sont renvoyés au modèle au message suivant. Avant, le superviseur donnait des ordres que personne n'exécutait.
+- **Les agents ne travaillent plus à l'aveugle** : les résultats de leurs commandes/écritures sont réinjectés dans leur conversation (avant, ils ne voyaient jamais la sortie).
+- **Vrais bugs corrigés dans la boucle des agents** : prompt système réellement injecté à chaque étape ; message initial `user` avec la tâche (compatible Claude) ; détection de fin uniquement quand TERMINÉ est la dernière ligne (plus d'arrêt prématuré sur le mot « terminé » en milieu de phrase) ; une seule boucle par agent ; appel API interruptible par /agent stop.
+- **Sécurité en arrière-plan alignée sur le premier plan** : commandes dangereuses, fichier de clés API, # CONFIRM, raccourcissement suspect de fichier → mise en pause avec action en attente. `/agent resume <n°>` vaut validation et exécute l'action ; `/agent stop <n°>` annule. Le mode safe met toute action sensible en attente. Les agents n'écrivent plus jamais via le readline du premier plan.
+- **Dossier figé par agent** : un `/cd` du premier plan ne déplace plus les agents en cours.
+- **Persistance par conversation corrigée** : chaque conversation sauvegarde SES agents dans son propre `agents.json` ; `/resume` et le lancement restaurent le groupe d'agents de la conversation (en pause). Supprimer une conversation supprime ses agents.
+- **/stop ne touche que le premier plan** : les agents continuent ; chacun s'arrête avec `/agent stop <n°>`.
+- **Commandes agents disponibles même quand l'IA travaille** : /agents, /agents watch, /agent ..., /supervise passent pendant que le premier plan est occupé.
+- **/agents watch corrigé** : bascule marche/arrêt, s'arrête tout seul quand plus aucun agent n'est actif, Ctrl+C quitte la surveillance sans quitter le programme.
+- **Garde-fou anti-récursion** : profondeur de délégation limitée à 4 (pas de limite sur le nombre d'agents en parallèle).
+
 ## 1.9.0 — Superviseur IA, persistance des agents, suppression du timeout
-- **Suppression du timeout de 120 secondes** : la fonction `run()` dans `exec.js` n'a plus de limite de temps. Les commandes longues (compilations, téléchargements, etc.) peuvent tourner autant que nécessaire. L'interruption reste possible via `/stop` ou Ctrl+C.
-- **Superviseur IA** : un agent spécial qui coordonne d'autres agents.
-  - Commande `/supervise <modèle> "<tâche>"` : lance un superviseur IA qui peut créer, surveiller, arrêter et relancer des sous-agents.
-  - Le superviseur se base sur la mémoire globale de l'utilisateur pour respecter ses préférences.
-  - Il peut envoyer des messages aux agents avec `/agent msg <id> "<message>"`.
-  - Affichage avec 👑 pour identifier le superviseur dans `/agents`.
-- **Persistance des agents dans la conversation** :
-  - Les agents sont sauvegardés dans `agents.json` dans le dossier de la conversation.
-  - `/resume` restaure automatiquement les agents de la conversation reprise (en mode `paused`).
-  - `/agent resume <id>` pour relancer un agent restauré.
-- **Nouvelle commande `/agents watch`** : tableau de bord en temps réel avec rafraîchissement automatique toutes les 2 secondes.
-- **Nouvelle commande `/agent msg <id> "<message>"`** : envoyer un message à un agent en cours d'exécution.
-- **Nouvelle commande `/agent clear-shared`** : effacer la mémoire partagée entre agents.
+- **Suppression du timeout de 120 secondes** dans `run()` (exec.js) : les commandes longues tournent autant que nécessaire ; interruption via /stop ou Ctrl+C.
+- **Superviseur IA** : `/supervise <modèle> "<tâche>"` lance une IA qui découpe, délègue, vérifie et recadre des agents, en respectant la mémoire globale de l'utilisateur.
+- **Persistance des agents** dans la conversation ; restauration via `/resume` (en pause).
+- **`/agents watch`** : tableau de bord rafraîchi toutes les 2 secondes.
+- **`/agent msg <n°> "<message>"`** : parler à un agent ; **`/agent clear-shared`** : vider la mémoire partagée.
 
 ## 1.8.0 — Système multi-agents et correction critique
-- **Correction critique de `launch.sh`** : suppression des chemins codés en dur. Le script détecte automatiquement son propre répertoire et le sous-dossier `src/`.
-- **Système multi-agents autonome** : plusieurs agents en tâche de fond, chacun avec sa propre conversation et son propre modèle.
-  - Exécution asynchrone non-bloquante : le prompt principal reste disponible.
-  - Mémoire partagée entre agents (`~/.horde-cli-memoire/agents_shared.json`).
-  - Sorties minimalistes : une phrase + la commande exécutée.
-- **Nouvelles commandes** : `/agent new`, `/agents`, `/agent stop`, `/agent resume`.
+- **Correction critique de `launch.sh`** : suppression des chemins codés en dur ; détection automatique du dossier du script et de `src/`.
+- **Système multi-agents autonome** : plusieurs agents en tâche de fond, chacun avec son modèle ; exécution asynchrone non bloquante ; mémoire partagée (`~/.horde-cli-memoire/agents_shared.json`) ; sorties minimalistes (une phrase + l'action).
+- **Commandes** : `/agent new`, `/agents`, `/agent stop`, `/agent resume`.
 
 ## 1.7.0 — Recherche sans clé, fiabilité, mode assistant, renommage
 - Projet renommé **HordeCLI** (bandeau, `package.json`).

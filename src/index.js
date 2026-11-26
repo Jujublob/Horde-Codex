@@ -18,6 +18,7 @@ import { memoryPath, globalMemoryPath } from './convos.js';
 let buffer = null;
 let busy = false;
 let lastSigint = 0;
+let watchTimer = null; // /agents watch : rafraîchissement auto (null = inactif)
 
 const show = () => banner(S.model, S.auto, { search: !!getSearchKey(), simple: S.simple, conv: S.convId });
 const prompt = () => {
@@ -50,11 +51,13 @@ async function useModel(m) {
 }
 
 // ---------- Fichiers (découpés en parties pour respecter le budget de tokens) ----------
+// Taille d'une partie envoyée par /file : généreuse pour les fournisseurs cloud (gros contexte),
+// plus stricte pour AI Horde (petit contexte, voir config.js).
 function fileChunkSize() {
   if (parseRef(S.model).provider === 'horde') return MAX_FILE_CHARS;
   const p = getProvider(parseRef(S.model).provider);
   const limits = p?.limits || DEFAULT_CLOUD_LIMITS;
-  return Math.floor(limits.prompt * 2.5);
+  return Math.floor(limits.prompt * 2.5); // large marge, laissée à fitToTokenBudget pour l'ajustement fin
 }
 
 function splitParts(text, size) {
@@ -147,7 +150,7 @@ function favCommand(arg) {
   showFavs();
 }
 
-// ---------- Clés API ----------
+// ---------- Clés API (enregistrées dans ~/.horde_settings.json, hors du dossier du programme) ----------
 function keyCommand(which, arg) {
   const horde = which === 'horde';
   const label = horde ? 'AI Horde' : 'recherche web';
@@ -160,7 +163,7 @@ function keyCommand(which, arg) {
     else console.log(`Clé ${label} : ${maskKey(k)} (via ${src})`);
     return;
   }
-  if (/\s/.test(v)) return console.log(chalk.red('La clé ne doit pas contenir d'espace.'));
+  if (/\s/.test(v)) return console.log(chalk.red('La clé ne doit pas contenir d’espace.'));
   if (v.toLowerCase() === 'off') {
     if (horde) setHordeKey(null); else setSearchKey(null);
     console.log(chalk.green(`✔ Clé ${label} retirée.`));
@@ -174,7 +177,7 @@ function keyCommand(which, arg) {
   }
 }
 
-// ---------- Fournisseurs IA ----------
+// ---------- Fournisseurs IA (Gemini, ChatGPT, Claude, personnalisés...) ----------
 const normKey = (k) => (['none', '-', 'aucune'].includes((k || '').toLowerCase()) ? '' : k);
 
 function showProviders() {
@@ -205,6 +208,7 @@ async function saveProvider(id, data) {
   await testProvider(id);
 }
 
+// Menu guidé : choisir un fournisseur dans la liste, puis coller la clé
 async function providerWizard() {
   const ids = Object.keys(PRESETS);
   console.log(chalk.hex('#c084fc').bold('\n Ajouter un fournisseur IA\n'));
@@ -226,7 +230,7 @@ async function providerWizard() {
   }
   const key = await askRaw(chalk.cyan(` Clé API ${data.name} (« none » si aucune) : `));
   if (!key) return console.log(chalk.gray('Annulé.'));
-  if (/\s/.test(key)) return console.log(chalk.red('La clé ne doit pas contenir d'espace.'));
+  if (/\s/.test(key)) return console.log(chalk.red('La clé ne doit pas contenir d’espace.'));
   await saveProvider(id, { ...data, key: normKey(key) });
 }
 
@@ -277,7 +281,7 @@ async function liveCommand(arg) {
   await showModels({ provider, filter: tokens.join(' ') });
 }
 
-// ---------- Tableau de bord des agents ----------
+// ---------- Agents : tableau de bord, surveillance, commandes ----------
 function showAgentsDashboard() {
   const list = getAllAgents();
   if (list.length === 0) {
@@ -292,7 +296,83 @@ function showAgentsDashboard() {
     console.log(`     Tâche : ${a.task}`);
     console.log(`     Dernier acte : ${a.lastAction}`);
   });
-  console.log(chalk.gray('\n  /agent stop <id> · /agent resume <id> · /agent msg <id> "<msg>" · /agent clear-shared'));
+  console.log(chalk.gray('\n  /agent stop <id> · /agent resume <id> · /agent msg <id> "<msg>" · /agent clear-shared · /agents watch'));
+}
+
+function stopWatch(msg) {
+  if (watchTimer) { clearInterval(watchTimer); watchTimer = null; if (msg) console.log(chalk.gray(msg)); }
+}
+
+function drawWatch() {
+  const list = getAllAgents();
+  console.clear();
+  console.log(chalk.bold.cyan(`📊 Agents — ${new Date().toLocaleTimeString('fr-FR')}   (Ctrl+C ou /agents watch pour quitter)`));
+  console.log(chalk.gray('─'.repeat(Math.min(process.stdout.columns || 60, 64))));
+  if (!list.length) console.log(chalk.gray('Aucun agent.'));
+  for (const a of list) {
+    const statusColor = a.status === 'running' ? chalk.green : (a.status === 'paused' ? chalk.yellow : (a.status === 'finished' ? chalk.blue : chalk.red));
+    const supervisorMark = a.isSupervisor ? chalk.hex('#fbbf24')(' 👑') : '';
+    console.log(`  #${a.id}${supervisorMark} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}`);
+    console.log(`     Tâche : ${a.task.slice(0, 70)}`);
+    console.log(`     Dernier acte : ${a.lastAction}`);
+  }
+  if (!list.some(a => a.status === 'running' || a.status === 'paused')) {
+    stopWatch();
+    console.log(chalk.gray('\nPlus aucun agent actif — surveillance arrêtée.'));
+    prompt();
+  }
+}
+
+// Commandes agents : utilisables AUSSI pendant que l'IA du premier plan travaille (voir plus bas).
+async function agentCommands(input) {
+  if (input === '/agents') { showAgentsDashboard(); return; }
+  if (input === '/agents watch') {
+    if (watchTimer) { stopWatch('\nSurveillance arrêtée.'); return; }
+    if (!getAllAgents().length) { console.log(chalk.gray('\nAucun agent à surveiller.')); return; }
+    drawWatch();
+    watchTimer = setInterval(drawWatch, 2000);
+    return;
+  }
+  if (input.startsWith('/agent ')) {
+    const parts = input.slice(7).trim().split(/\s+/);
+    const subCmd = parts[0]?.toLowerCase();
+    if (subCmd === 'new') {
+      if (parts.length < 4) {
+        console.log(chalk.yellow('\nUsage: /agent new <modèle> <auto|safe> "<tâche>"'));
+        console.log(chalk.gray('Ex: /agent new @openai:gpt-4 auto "Analyse tous les fichiers .js du dossier"'));
+      } else {
+        const model = parts[1];
+        const mode = parts[2].toLowerCase();
+        if (mode !== 'auto' && mode !== 'safe') console.log(chalk.red('\nLe mode doit être "auto" ou "safe".'));
+        else createAgent(parts.slice(3).join(' ').replace(/^"|"$/g, ''), model, mode);
+      }
+    } else if (subCmd === 'stop') {
+      const id = parseInt(parts[1]);
+      if (!stopAgent(id)) console.log(chalk.red(`\n❌ Agent ${id} introuvable ou déjà arrêté.`));
+    } else if (subCmd === 'resume') {
+      const id = parseInt(parts[1]);
+      if (!resumeAgent(id)) console.log(chalk.red(`\n❌ Impossible de relancer l'agent ${id}.`));
+    } else if (subCmd === 'msg') {
+      if (parts.length < 3) console.log(chalk.yellow('\nUsage: /agent msg <id> "<message>"'));
+      else sendMessageToAgent(parseInt(parts[1]), parts.slice(2).join(' ').replace(/^"|"$/g, ''));
+    } else if (subCmd === 'clear-shared') {
+      clearSharedMemoryCommand();
+    } else {
+      console.log(chalk.yellow('\nCommande /agent inconnue. Tape /help.'));
+    }
+    return;
+  }
+  if (input.startsWith('/supervise ')) {
+    const parts = input.slice(11).trim().split(/\s+/);
+    if (parts.length < 2) {
+      console.log(chalk.yellow('\nUsage: /supervise <modèle> "<tâche>"'));
+      console.log(chalk.gray('Ex: /supervise @openai:gpt-4 "Refactorise tout le code du projet"'));
+      console.log(chalk.gray("Le superviseur est une IA qui crée et coordonne d'autres agents."));
+    } else {
+      createSupervisor(parts.slice(1).join(' ').replace(/^"|"$/g, ''), parts[0]);
+    }
+    return;
+  }
 }
 
 // ---------- Commandes ----------
@@ -303,6 +383,8 @@ async function command(input) {
     S.pending = []; saveSession();
     S.last = null;
     show();
+    // La mémoire vit dans le dossier de la conversation courante (~/.horde-cli-memoire/conversations/<n°>/),
+    // plus jamais dans ~/.ia_memory.json : on propose de vider celle de cette conversation.
     const hasContent = (p) => { try { const t = fs.readFileSync(p, 'utf-8').trim(); return !!t && t !== '{}' && t !== '[]'; } catch { return false; } };
     const memTargets = [memoryPath(S.convId), globalMemoryPath()].filter(Boolean);
     const existing = memTargets.filter(hasContent);
@@ -366,90 +448,7 @@ async function command(input) {
   }
   else if (input === '/save') save();
   else if (input.startsWith('/file ')) await sendFile(input.slice(6));
-
-  // ========== COMMANDES AGENTS ==========
-  else if (input === '/agents') {
-    showAgentsDashboard();
-  }
-  else if (input === '/agents watch') {
-    console.log(chalk.cyan('\n👀 Mode surveillance activé (Ctrl+C pour quitter)\n'));
-    const interval = setInterval(() => {
-      const list = getAllAgents();
-      if (list.length === 0) {
-        clearInterval(interval);
-        console.log(chalk.gray('\nTous les agents sont terminés.'));
-        return;
-      }
-      console.clear();
-      console.log(chalk.bold.cyan(`📊 Tableau de bord des agents - ${new Date().toLocaleTimeString('fr-FR')}`));
-      console.log(chalk.gray('─'.repeat(60)));
-      list.forEach(a => {
-        const statusColor = a.status === 'running' ? chalk.green : (a.status === 'paused' ? chalk.yellow : (a.status === 'finished' ? chalk.blue : chalk.red));
-        const supervisorMark = a.isSupervisor ? chalk.hex('#fbbf24')(' 👑 SUPERVISEUR') : '';
-        console.log(`  #${a.id}${supervisorMark} | ${statusColor(a.status.toUpperCase().padEnd(8))} | ${a.modelRef}`);
-        console.log(`     Tâche : ${a.task}`);
-        console.log(`     Dernier acte : ${a.lastAction}`);
-        console.log('');
-      });
-      console.log(chalk.gray('Ctrl+C pour quitter la surveillance'));
-    }, 2000);
-    // Le Ctrl+C standard du programme interrompt déjà, pas besoin de gestion spéciale ici
-  }
-  else if (input.startsWith('/agent ')) {
-    const parts = input.slice(7).trim().split(/\s+/);
-    const subCmd = parts[0]?.toLowerCase();
-
-    if (subCmd === 'new') {
-      if (parts.length < 4) {
-        console.log(chalk.yellow('\nUsage: /agent new <modèle> <auto|safe> "<tâche>"'));
-        console.log(chalk.gray('Ex: /agent new @openai:gpt-4 auto "Analyse tous les fichiers .js du dossier"'));
-      } else {
-        const model = parts[1];
-        const mode = parts[2].toLowerCase();
-        if (mode !== 'auto' && mode !== 'safe') {
-          console.log(chalk.red('\nLe mode doit être "auto" ou "safe".'));
-        } else {
-          const task = parts.slice(3).join(' ').replace(/^"|"$/g, '');
-          createAgent(task, model, mode);
-        }
-      }
-    } else if (subCmd === 'stop') {
-      const id = parseInt(parts[1]);
-      if (stopAgent(id)) console.log(chalk.green(`\n🛑 Agent ${id} arrêté.`));
-      else console.log(chalk.red(`\n❌ Agent ${id} introuvable ou déjà arrêté.`));
-    } else if (subCmd === 'resume') {
-      const id = parseInt(parts[1]);
-      if (resumeAgent(id)) console.log(chalk.green(`\n▶️ Agent ${id} relancé.`));
-      else console.log(chalk.red(`\n❌ Impossible de relancer l'agent ${id}.`));
-    } else if (subCmd === 'msg') {
-      if (parts.length < 3) {
-        console.log(chalk.yellow('\nUsage: /agent msg <id> "<message>"'));
-      } else {
-        const id = parseInt(parts[1]);
-        const message = parts.slice(2).join(' ').replace(/^"|"$/g, '');
-        sendMessageToAgent(id, message);
-      }
-    } else if (subCmd === 'clear-shared') {
-      clearSharedMemoryCommand();
-    } else {
-      console.log(chalk.yellow('\nCommande /agent inconnue. Tape /help.'));
-    }
-  }
-
-  // ========== COMMANDE SUPERVISEUR ==========
-  else if (input.startsWith('/supervise ')) {
-    const parts = input.slice(11).trim().split(/\s+/);
-    if (parts.length < 2) {
-      console.log(chalk.yellow('\nUsage: /supervise <modèle> "<tâche>"'));
-      console.log(chalk.gray('Ex: /supervise @openai:gpt-4 "Refactorise tout le code du projet"'));
-      console.log(chalk.gray('Le superviseur est une IA qui crée et coordonne d\'autres agents.'));
-    } else {
-      const model = parts[0];
-      const task = parts.slice(1).join(' ').replace(/^"|"$/g, '');
-      createSupervisor(task, model);
-    }
-  }
-
+  else if (input === '/agents' || input === '/agents watch' || input.startsWith('/agent ') || input.startsWith('/supervise ')) await agentCommands(input);
   else if (/^\/[a-z0-9]+(\s|$)/i.test(input)) console.log(chalk.red('Commande inconnue. /help pour la liste.'));
   else await askAI(input);
 }
@@ -469,8 +468,10 @@ else console.log(chalk.gray(`Conversation #${S.convId}. /resume : liste des conv
 prompt();
 rl.on('close', () => process.exit(0));
 
-// Ctrl+C : interrompt l'IA si elle travaille ; sinon il faut le faire 2 fois de suite pour quitter
+// Ctrl+C : quitte d'abord la surveillance ; sinon interrompt l'IA si elle travaille ;
+// sinon il faut le faire 2 fois de suite pour quitter
 rl.on('SIGINT', () => {
+  if (watchTimer) { stopWatch('\nSurveillance arrêtée.'); return prompt(); }
   const now = Date.now();
   if (buffer !== null) {
     buffer = null;
@@ -504,6 +505,11 @@ rl.on('line', async (raw) => {
     if (input === '/auto') {
       S.auto = !S.auto;
       console.log(chalk.yellow(`Mode auto : ${S.auto ? 'ON' : 'OFF'}`));
+    } else if (input === '/agents' || input === '/agents watch' || input.startsWith('/agent ') || input.startsWith('/supervise ')) {
+      // Les commandes agents restent disponibles PENDANT que l'IA du premier plan travaille :
+      // voir, arrêter, relancer, lancer un superviseur à tout moment.
+      await agentCommands(input);
+      prompt();
     } else if (input) console.log(chalk.yellow("⏳ L'IA travaille… /stop pour l'interrompre."));
     return;
   }

@@ -2,18 +2,32 @@
 
 Numérotation indicative (pas de tags Git officiels tant que tu ne les poses pas toi-même).
 
+## 1.10.0 — Aide agents, API par appel, /agent show, contrôle d'autonomie par le superviseur
+- **`/help` : nouvelle section « Agents »** listant toutes les commandes (new, agents, watch, show, stop, resume, msg, supervise, auto, valid, allow, deny, user, clear-shared). Le bandeau affiche aussi une ligne « Agents : N actif(s) » quand des agents tournent.
+- **`api.js` : `chat()` retourne `{ text, finish }`** — la raison de fin est propre à chaque appel. Suppression de la variable globale `getFinishReason()` qui se mélangeait entre le premier plan et les agents parallèles.
+- **`/agent show <n°>`** : voir les derniers échanges d'un agent sans l'arrêter (aussi disponible pour le superviseur via directive, qui reçoit un extrait lisible).
+- **Contrôle de l'autonomie des agents par le superviseur** :
+  - `/agent auto <n°>` : accorde 10 étapes autonomes puis pause automatique (renouvelable). Le superviseur est prévenu quand l'agent s'arrête.
+  - `/agent valid <n°>` : chaque action de l'agent est soumise au superviseur, qui répond `/agent allow <n°>` ou `/agent deny <n°>`.
+  - `/agent user <n°>` : rendre le contrôle à l'utilisateur.
+  - Ces commandes sont réservées au superviseur (ou à l'utilisateur / l'IA principale) ; un agent de tâche ne peut pas se les accorder à lui-même ni les accorder aux autres.
+  - Les garde-fous durs (commande dangereuse, fichier de clés API, `# CONFIRM`, raccourcissement suspect) restent TOUJOURS soumis à l'utilisateur, jamais au superviseur.
+  - Si le superviseur n'est pas actif, une action en mode validation retombe sur une validation utilisateur.
+- Le régime de supervision (auto / validation) et les étapes restantes sont sauvegardés avec l'agent et restaurés via `/resume`.
+- Les blocs ```agent sont désormais neutralisés dans le rendu markdown (comme file:/append:/search).
+
 ## 1.9.1 — Correctif de syntaxe, l'IA lance elle-même des agents, fiabilité du multi-agents
 - **Correctif bloquant** : apostrophe droite introduite par erreur dans `index.js` (`d'espace` au lieu de `d’espace`) → `SyntaxError` au démarrage. Corrigé (2 occurrences). Tout le nouveau code a été validé syntaxiquement avec un moteur JavaScript réel avant livraison.
 - **L'IA sait maintenant qu'elle peut lancer des agents** : nouveau `AGENTS_PROMPT` (config.js) injecté dans le prompt système de la conversation principale ET des agents (sauf mode assistant). Convention unique : bloc ```agent:<modèle> <auto|safe> pour déléguer, lignes /agents, /agent stop|resume|msg|new pour piloter.
-- **Ces demandes sont réellement exécutées** : `processAgentControl` parse les réponses de n'importe quelle IA (principale, superviseur, agent) et exécute les délégations/commandes ; les états et résultats sont renvoyés au modèle au message suivant. Avant, le superviseur donnait des ordres que personne n'exécutait.
-- **Les agents ne travaillent plus à l'aveugle** : les résultats de leurs commandes/écritures sont réinjectés dans leur conversation (avant, ils ne voyaient jamais la sortie).
-- **Vrais bugs corrigés dans la boucle des agents** : prompt système réellement injecté à chaque étape ; message initial `user` avec la tâche (compatible Claude) ; détection de fin uniquement quand TERMINÉ est la dernière ligne (plus d'arrêt prématuré sur le mot « terminé » en milieu de phrase) ; une seule boucle par agent ; appel API interruptible par /agent stop.
-- **Sécurité en arrière-plan alignée sur le premier plan** : commandes dangereuses, fichier de clés API, # CONFIRM, raccourcissement suspect de fichier → mise en pause avec action en attente. `/agent resume <n°>` vaut validation et exécute l'action ; `/agent stop <n°>` annule. Le mode safe met toute action sensible en attente. Les agents n'écrivent plus jamais via le readline du premier plan.
+- **Ces demandes sont réellement exécutées** : `processAgentControl` parse les réponses de n'importe quelle IA (principale, superviseur, agent) et exécute les délégations/commandes ; les états et résultats sont renvoyés au modèle au message suivant.
+- **Les agents ne travaillent plus à l'aveugle** : les résultats de leurs commandes/écritures sont réinjectés dans leur conversation.
+- **Vrais bugs corrigés dans la boucle des agents** : prompt système réellement injecté à chaque étape ; message initial `user` avec la tâche (compatible Claude) ; détection de fin uniquement quand TERMINÉ est la dernière ligne ; une seule boucle par agent ; appel API interruptible par /agent stop.
+- **Sécurité en arrière-plan alignée sur le premier plan** : commandes dangereuses, fichier de clés API, # CONFIRM, raccourcissement suspect → mise en pause avec action en attente. `/agent resume <n°>` vaut validation ; `/agent stop <n°>` annule.
 - **Dossier figé par agent** : un `/cd` du premier plan ne déplace plus les agents en cours.
-- **Persistance par conversation corrigée** : chaque conversation sauvegarde SES agents dans son propre `agents.json` ; `/resume` et le lancement restaurent le groupe d'agents de la conversation (en pause). Supprimer une conversation supprime ses agents.
+- **Persistance par conversation corrigée** : chaque conversation sauvegarde SES agents dans son propre `agents.json` ; `/resume` et le lancement restaurent le groupe d'agents (en pause). Supprimer une conversation supprime ses agents.
 - **/stop ne touche que le premier plan** : les agents continuent ; chacun s'arrête avec `/agent stop <n°>`.
 - **Commandes agents disponibles même quand l'IA travaille** : /agents, /agents watch, /agent ..., /supervise passent pendant que le premier plan est occupé.
-- **/agents watch corrigé** : bascule marche/arrêt, s'arrête tout seul quand plus aucun agent n'est actif, Ctrl+C quitte la surveillance sans quitter le programme.
+- **/agents watch corrigé** : bascule marche/arrêt, s'arrête quand plus aucun agent n'est actif, Ctrl+C quitte la surveillance sans quitter le programme.
 - **Garde-fou anti-récursion** : profondeur de délégation limitée à 4 (pas de limite sur le nombre d'agents en parallèle).
 
 ## 1.9.0 — Superviseur IA, persistance des agents, suppression du timeout
